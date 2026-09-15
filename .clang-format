@@ -1,0 +1,31 @@
+---
+# Основа стиля
+BasedOnStyle: LLVM
+
+# Отступы (4 пробела)
+IndentWidth: 4
+TabWidth: 4
+UseTab: Never
+
+# Длина строки
+ColumnLimit: 100
+
+# Скобки для функций и условий на той же строке
+BreakBeforeBraces: Attach
+
+# Выравнивание указателей ( int *ptr вместо int* ptr )
+PointerAlignment: Right
+
+# Сортировка инклудов
+SortIncludes: CaseSensitive
+
+# Отступы в case внутри switch
+IndentCaseLabels: true
+
+# Разрешить короткие блоки на одной строке (например, if (x) return;)
+AllowShortBlocksOnASingleLine: Empty
+AllowShortFunctionsOnASingleLine: Empty
+AllowShortIfStatementsOnASingleLine: Never
+...
+
+

@@ -1,0 +1,3 @@
++> "secret" => s;
+
+$val = s.hidden;

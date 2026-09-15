@@ -1,0 +1,3 @@
+$take_int(a: i32) -> i32 { a }
+
+$bad = take_int(1i64);

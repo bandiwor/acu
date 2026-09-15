@@ -1,0 +1,35 @@
+CompileFlags:
+  Add: 
+    - -xc
+    - -std=gnu11
+    - -Wall
+    - -Wextra
+    - -Wshadow
+    - -Werror=implicit-function-declaration
+    - -Iinclude
+  Remove: 
+    - -Wmissing-prototypes
+
+Diagnostics:
+  ClangTidy:
+    Add: 
+      - performance-*
+      - bugprone-*
+      - misc-*
+      - readability-*
+    Remove:
+      - misc-no-recursion                          # Отключаем предупреждения о рекурсивных вызовах
+      - readability-braces-around-statements
+      - readability-identifier-length               # Отключаем запрет на короткие имена (a, b, i)
+      - readability-magic-numbers                   # Отключаем запрет на "магические числа"
+      - readability-function-cognitive-complexity   # Порог когнитивной сложности
+      - readability-function-size                   # Ограничения на размер и ветвления функций
+      - bugprone-easily-swappable-parameters        # Предупреждения о перепутанных соседних аргументах одного типа
+      - readability-implicit-bool-conversion        # Неявные приведения к bool
+      - bugprone-narrowing-conversions              # Неявные сужающие преобразования типов
+      - bugprone-implicit-widening-of-multiplication-result # Неявные расширения при умножении
+
+InlayHints:
+  Enabled: yes
+  ParameterNames: yes
+  DeducedTypes: yes

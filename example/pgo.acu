@@ -1,0 +1,34 @@
++> "io" => io;
++> "sys" => sys;
+
+$tak(x: u64, y: u64, z: u64) -> u64 {
+    # y < x {
+        tak(
+            tak(x - 1, y, z),
+            tak(y - 1, z, x),
+            tak(z - 1, x, y)
+        )
+    } ! {
+        z
+    }
+}
+
+{
+    $start_cycles = sys.rdtsc();
+    $start_ns     = sys.clockNs();
+
+    $res = tak(24, 16, 8);
+
+    $elapsed_ns     = sys.clockNs() - start_ns;
+    $elapsed_cycles = sys.rdtsc() - start_cycles;
+
+    // tak(18, 12, 6) = 7
+    io.printU64(res);
+    io.println();
+
+    io.printU64(elapsed_ns);
+    io.println();
+
+    io.printU64(elapsed_cycles);
+    io.println();
+}

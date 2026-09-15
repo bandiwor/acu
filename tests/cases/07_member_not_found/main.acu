@@ -1,0 +1,3 @@
++> "empty_mod" => em;
+
+$val = em.undefined_var;

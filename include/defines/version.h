@@ -1,0 +1,8 @@
+#pragma once
+
+#define ACU_TARGET "x86"
+#define ACU_COMPILER "Clang"
+
+#define ACU_CURRENT_VERSION_MAJOR 1
+#define ACU_CURRENT_VERSION_MINOR 0
+#define ACU_CURRENT_VERSION_PATCH 0
