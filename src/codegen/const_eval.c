@@ -1,6 +1,8 @@
 #include "codegen/const_eval.h"
 #include "analyzer/analyzer.h"
 #include "codegen/math_utils.h"
+#include "defines/types.h"
+#include "vm/syscall.h"
 
 AcuConstVal AcuCodeGen_EvalConst(AcuWorkspace *ws, AstNodeIdx expr_idx) {
     if (expr_idx == ACU_NULL_IDX) {
@@ -129,6 +131,104 @@ AcuConstVal AcuCodeGen_EvalConst(AcuWorkspace *ws, AstNodeIdx expr_idx) {
                 }
             }
             break;
+        }
+
+        case AST_CALL: {
+            SymbolId callee_sym_id = V_At(&ws->node_analysis, expr_idx).call.callee_sym;
+            if (callee_sym_id == ACU_NULL_IDX) {
+                return (AcuConstVal){.kind = CONST_NONE};
+            }
+
+            AcuSymbol *sym = AcuSymbolTable_Get(ws->symbols, callee_sym_id);
+            if (!sym || sym->kind != ACU_SYMBOL_SYSTEM_FUNCTION) {
+                return (AcuConstVal){.kind = CONST_NONE};
+            }
+
+            AcuSyscallId sys_id = (AcuSyscallId)sym->as.syscall_tag;
+            const AcuSyscallInfo *info = AcuSyscall_GetInfo(sys_id);
+
+            if (!info || info->purity != ACU_PURITY_CONST || !info->handler) {
+                return (AcuConstVal){.kind = CONST_NONE};
+            }
+
+            u32 arg_count = node->as.call.arguments_count;
+            if (arg_count > 16) {
+                return (AcuConstVal){.kind = CONST_NONE};
+            }
+
+            ExtraIdx arg_start = node->as.call.start_idx;
+            AcuValue args[16];
+
+            for (u32 i = 0; i < arg_count; ++i) {
+                AstNodeIdx arg_idx = AcuAstBuilder_GetIdxByExtra(ws->builder, arg_start + i);
+                AcuConstVal cv = AcuCodeGen_EvalConst(ws, arg_idx);
+                if (cv.kind == CONST_NONE) {
+                    return (AcuConstVal){.kind = CONST_NONE};
+                }
+
+                TypeId arg_type = V_At(&ws->node_types, arg_idx);
+
+                if (cv.kind == CONST_FLOAT) {
+                    if (arg_type == TYPE_PRIMITIVE_F32) {
+                        args[i].f32 = (f32)cv.as.f64_val;
+                    } else {
+                        args[i].f64 = cv.as.f64_val;
+                    }
+                } else if (cv.kind == CONST_INT) {
+                    args[i].i64 = cv.as.i64_val;
+                } else if (cv.kind == CONST_BOOL) {
+                    args[i].u64 = cv.as.bool_val ? 1 : 0;
+                } else {
+                    return (AcuConstVal){.kind = CONST_NONE};
+                }
+            }
+
+            AcuValue ret_val = {0};
+            AcuVmStatus status = info->handler(args, (u8)arg_count, &ret_val);
+            if (status != ACU_VM_OK) {
+                return (AcuConstVal){.kind = CONST_NONE};
+            }
+
+            TypeId ret_type = V_At(&ws->node_types, expr_idx);
+            if (TypePrimitiveKind_IsFloat(ret_type)) {
+                if (ret_type == TYPE_PRIMITIVE_F32) {
+                    return (AcuConstVal){.kind = CONST_FLOAT, .as.f64_val = (f64)ret_val.f32};
+                }
+                return (AcuConstVal){.kind = CONST_FLOAT, .as.f64_val = ret_val.f64};
+            }
+
+            if (TypePrimitiveKind_IsSignedInt(ret_type) ||
+                TypePrimitiveKind_IsUnsignedInt(ret_type)) {
+                return (AcuConstVal){.kind = CONST_INT, .as.i64_val = ret_val.i64};
+            }
+
+            return (AcuConstVal){.kind = CONST_INT, .as.i64_val = (i64)ret_val.u64};
+        }
+
+        case AST_TYPE_CAST: {
+            AcuConstVal val = AcuCodeGen_EvalConst(ws, node->as.type_cast.expr);
+            if (val.kind == CONST_NONE) {
+                return val;
+            }
+
+            TypeId target_type = V_At(&ws->node_types, expr_idx);
+
+            if (TypePrimitiveKind_IsFloat(target_type)) {
+                if (val.kind == CONST_INT) {
+                    return (AcuConstVal){.kind = CONST_FLOAT, .as.f64_val = (f64)val.as.i64_val};
+                }
+                return val;
+            }
+
+            if (TypePrimitiveKind_IsSignedInt(target_type) ||
+                TypePrimitiveKind_IsUnsignedInt(target_type)) {
+                if (val.kind == CONST_FLOAT) {
+                    return (AcuConstVal){.kind = CONST_INT, .as.i64_val = (i64)val.as.f64_val};
+                }
+                return val;
+            }
+
+            return val;
         }
 
         default:
