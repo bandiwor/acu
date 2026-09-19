@@ -5,6 +5,7 @@
 #include "pool/constant_pool.h"
 #include "pool/string_pool.h"
 #include "vm/syscall.h"
+#include <stdio.h>
 #include <stdlib.h>
 
 bool AcuChunk_Serialize(FILE *file, const AcuChunk *chunk) {
@@ -13,7 +14,7 @@ bool AcuChunk_Serialize(FILE *file, const AcuChunk *chunk) {
     }
 
     u32 code_count = (u32)V_Count(&chunk->code);
-    u32 constant_count = (u32)(AcuConstantPool_RawDataLength(&chunk->constants) / sizeof(u64));
+    u32 constant_count = AcuConstantPool_RawDataLength(&chunk->constants);
     u32 string_pool_bytes = AcuStringPool_RawDataLength(&chunk->strings);
 
     const void *constants_data = AcuConstantPool_RawData(&chunk->constants);
