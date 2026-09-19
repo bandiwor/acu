@@ -45,6 +45,7 @@ int main(int argc, char **argv) {
     }
 
     AcuVM_Free(&vm);
+    AcuRawChunk_Free(&chunk);
 
     return EXIT_SUCCESS;
 }

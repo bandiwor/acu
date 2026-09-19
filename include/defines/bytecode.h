@@ -5,10 +5,6 @@
 typedef u8 AcuReg;
 typedef u32 AcuInstruction;
 
-/* ========================================================================= */
-/* 1. РЕГИСТРОВЫЕ ТАРГЕТЫ                                                    */
-/* ========================================================================= */
-
 typedef struct {
     u16 raw;
 } AcuTarget;
@@ -41,10 +37,6 @@ static inline AcuReg AcuTarget_ToRealReg(AcuTarget target) {
     assert(AcuTarget_IsRealReg(target) && "Target is not a physical register (AUTO or NONE)!");
     return (AcuReg)target.raw;
 }
-
-/* ========================================================================= */
-/* 2. ПЕРЕЧИСЛЕНИЯ ФОРМАТОВ, ЧИСТОТЫ И ФЛАГОВ                                */
-/* ========================================================================= */
 
 typedef enum {
     OP_FMT_NONE,
@@ -142,6 +134,8 @@ typedef enum {
     X(OP_TAILCALL, "TAILCALL", 2, OP_FMT_ABC_WIDE, OP_READ_RANGE_CALL, OP_WRITE_NONE,              \
       OP_EFFECT_CONTROL_FLOW, ACU_PURITY_IMPURE, ACU_FLAG_TERMINATOR)                              \
     X(OP_SYSCALL, "SYSCALL", 2, OP_FMT_ABC_WIDE, OP_READ_RANGE_SYSCALL, OP_WRITE_A,                \
+      OP_EFFECT_SYSCALL, ACU_PURITY_IMPURE, ACU_FLAG_NONE)                                         \
+    X(OP_SYSCALL_VOID, "SYSCALL_VOID", 2, OP_FMT_ABC_WIDE, OP_READ_RANGE_SYSCALL, OP_WRITE_NONE,   \
       OP_EFFECT_SYSCALL, ACU_PURITY_IMPURE, ACU_FLAG_NONE)                                         \
                                                                                                    \
     X(OP_JUMP_EQ, "JUMP_EQ", 1, OP_FMT_ABsC, OP_READ_AB, OP_WRITE_NONE, OP_EFFECT_CONTROL_FLOW,    \
@@ -358,7 +352,7 @@ typedef enum {
 #define X(name, str, slots, fmt, rmode, wmode, effect, purity, flags) name,
     X_ACU_OPCODES(X)
 #undef X
-        ACU_OPCODE_COUNT
+        ACU_OPCODE_COUNT,
 } AcuOpcode;
 
 typedef struct {

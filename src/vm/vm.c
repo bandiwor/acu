@@ -388,6 +388,27 @@ op_OP_SYSCALL: {
     DISPATCH();
 }
 
+op_OP_SYSCALL_VOID: {
+    AcuReg base = AcuInst_GetB(instr);
+    u8 argc = AcuInst_GetC(instr);
+    u32 sys_id = (u32)ip[1];
+
+    if (unlikely(base + argc > ACU_REG_WINDOW)) {
+        vm->last_status = ACU_VM_ERR_STACK_OVERFLOW;
+        return ACU_VM_ERR_STACK_OVERFLOW;
+    }
+
+    AcuValue dummy;
+    AcuVmStatus status = g_acu_syscall_table[sys_id].handler(regs + base, argc, &dummy);
+    if (unlikely(status != ACU_VM_OK)) {
+        vm->last_status = status;
+        return status;
+    }
+
+    ip += 2;
+    DISPATCH();
+}
+
 op_OP_ADD: {
     regs[AcuInst_GetA(instr)].u64 = regs[AcuInst_GetB(instr)].u64 + regs[AcuInst_GetC(instr)].u64;
 
@@ -928,7 +949,7 @@ op_OP_FGTE: {
 }
 
 op_OP_SEXT8: {
-    regs[AcuInst_GetA(instr)].i64 = (i8)regs[AcuInst_GetB(instr)].i64;
+    regs[AcuInst_GetA(instr)].i64 = (i64)((i8)regs[AcuInst_GetB(instr)].i64);
 
     ip++;
     DISPATCH();

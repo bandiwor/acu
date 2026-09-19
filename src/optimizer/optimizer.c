@@ -48,7 +48,8 @@ static inline bool AcuOpt_IsBytecodeCall(AcuOpcode op) {
 }
 
 static inline AcuSyscallId AcuOpt_GetSyscallIdAt(const AcuInstruction *code, u32 ip, u32 count) {
-    assert(AcuInst_GetOp(code[ip]) == OP_SYSCALL);
+    AcuOpcode op = AcuInst_GetOp(code[ip]);
+    assert(op == OP_SYSCALL || op == OP_SYSCALL_VOID);
     if (ip + 1 < count) {
         return (AcuSyscallId)code[ip + 1];
     }
@@ -64,7 +65,7 @@ static inline bool AcuOpt_IsInstructionTerminator(const AcuInstruction *code, u3
         return true;
     }
 
-    if (op == OP_SYSCALL) {
+    if (op == OP_SYSCALL || op == OP_SYSCALL_VOID) {
         AcuSyscallId sys_id = AcuOpt_GetSyscallIdAt(code, ip, count);
         const AcuSyscallInfo *sinfo = AcuSyscall_GetInfo(sys_id);
         if (sinfo && sinfo->is_terminator) {
@@ -99,7 +100,7 @@ static inline bool AcuOpt_IsInstructionPure(const AcuInstruction *code, u32 ip, 
     const AcuInstruction inst = code[ip];
     const AcuOpcode op = AcuInst_GetOp(inst);
 
-    if (op == OP_SYSCALL) {
+    if (op == OP_SYSCALL || op == OP_SYSCALL_VOID) {
         AcuSyscallId sys_id = AcuOpt_GetSyscallIdAt(code, ip, count);
         const AcuSyscallInfo *sinfo = AcuSyscall_GetInfo(sys_id);
         return sinfo && (sinfo->purity <= ACU_PURITY_PURE);
@@ -299,7 +300,7 @@ static bool AcuOpt_IsRegDeadAfter(const AcuChunk *chunk, u32 from_ip, AcuReg reg
             return true;
         }
 
-        if (op == OP_SYSCALL) {
+        if (op == OP_SYSCALL || op == OP_SYSCALL_VOID) {
             AcuSyscallId sys_id = AcuOpt_GetSyscallIdAt(code, ip, count);
             const AcuSyscallInfo *sinfo = AcuSyscall_GetInfo(sys_id);
             if (sinfo && sinfo->is_terminator) {
@@ -583,6 +584,10 @@ static bool AcuOpt_EliminateDeadStores(AcuChunk *chunk, const bool *is_target, u
 
                     if (op == OP_CALL) {
                         AcuInst_SetOp(inst, OP_CALL_VOID);
+                        AcuInst_SetA(inst, 0);
+                        changed = true;
+                    } else if (op == OP_SYSCALL) {
+                        AcuInst_SetOp(inst, OP_SYSCALL_VOID);
                         AcuInst_SetA(inst, 0);
                         changed = true;
                     }

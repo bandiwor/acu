@@ -1897,6 +1897,34 @@ static AcuTarget AcuCodeGen_EmitStandardCall(AcuCodeGen *cg, SymbolId callee_sym
 
 static AcuTarget AcuCodeGen_EmitCall(AcuCodeGen *cg, AstNodeIdx expr_idx, const AstNode *node,
                                      AcuTarget target) {
+    AcuConstVal const_val = AcuCodeGen_EvalConst(cg->ws, expr_idx);
+    if (const_val.kind != CONST_NONE) {
+        if (AcuTarget_IsNone(target)) {
+            return ACU_TARGET_NONE;
+        }
+
+        AcuReg dst = AcuCodeGen_ResolveTarget(cg, target);
+        AcuRegSet_MarkUsed(&cg->reg_set, dst);
+
+        if (const_val.kind == CONST_FLOAT) {
+            u32 const_idx = AcuConstantPool_InternF64(&cg->chunk->constants, const_val.as.f64_val);
+            AcuCodeGen_Emit(cg, AcuInst_Encode_ABx(OP_LOAD_CONST, dst, (u16)const_idx));
+        } else if (const_val.kind == CONST_INT) {
+            i64 val = const_val.as.i64_val;
+            if (val >= -32768 && val <= 32767) {
+                AcuCodeGen_Emit(cg, AcuInst_Encode_AsBx(OP_LOAD_IMM, dst, (i16)val));
+            } else {
+                u32 const_idx = AcuConstantPool_InternI64(&cg->chunk->constants, val);
+                AcuCodeGen_Emit(cg, AcuInst_Encode_ABx(OP_LOAD_CONST, dst, (u16)const_idx));
+            }
+        } else if (const_val.kind == CONST_BOOL) {
+            AcuCodeGen_Emit(cg,
+                            AcuInst_Encode_AsBx(OP_LOAD_IMM, dst, const_val.as.bool_val ? 1 : 0));
+        }
+
+        return AcuTarget_Reg(dst);
+    }
+
     if (AcuTarget_IsNone(target) && AcuCodeGen_IsPure(cg->ws, expr_idx)) {
         return ACU_TARGET_NONE;
     }
@@ -1928,8 +1956,9 @@ static AcuTarget AcuCodeGen_EmitCall(AcuCodeGen *cg, AstNodeIdx expr_idx, const 
         AcuRegSet saved_regs = cg->reg_set;
         AcuReg first_arg =
             (arg_count > 0) ? AcuCodeGen_EmitContiguousArgs(cg, arg_start, arg_count) : 0;
+        AcuOpcode op = is_void ? OP_SYSCALL_VOID : OP_SYSCALL;
 
-        AcuCodeGen_EmitWide(cg, AcuInst_Encode_ABC(OP_SYSCALL, dst, first_arg, (u8)arg_count),
+        AcuCodeGen_EmitWide(cg, AcuInst_Encode_ABC_WIDE(op, dst, first_arg, (u8)arg_count),
                             sym->as.syscall_tag);
 
         cg->reg_set = saved_regs;

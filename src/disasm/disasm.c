@@ -230,8 +230,8 @@ u32 AcuDisasm_PrintInstruction(FILE *out, const AcuChunk *chunk, u32 ip) {
     i16 sbx = (i16)(inst >> 16);
     i32 sax = (i32)inst >> 8;
 
-    char operands[48] = {0};
-    char comment[96] = {0};
+    char operands[80] = {0};
+    char comment[128] = {0};
     u32 words_consumed = 1;
 
     switch (info->format) {
@@ -287,7 +287,7 @@ u32 AcuDisasm_PrintInstruction(FILE *out, const AcuChunk *chunk, u32 ip) {
             words_consumed = (ip + 1 < V_Count(&chunk->code)) ? 2 : 1;
             u32 payload = (words_consumed == 2) ? (u32)V_At(&chunk->code, ip + 1) : 0;
 
-            if (op == OP_SYSCALL) {
+            if (op == OP_SYSCALL || op == OP_SYSCALL_VOID) {
                 char target[128];
                 if (payload < ACU_SYSCALL_COUNT && g_acu_syscall_table[payload].name) {
                     snprintf(target, sizeof(target), "%s.%s", g_acu_syscall_table[payload].module,
@@ -296,24 +296,45 @@ u32 AcuDisasm_PrintInstruction(FILE *out, const AcuChunk *chunk, u32 ip) {
                     snprintf(target, sizeof(target), "unknown_0x%X", payload);
                 }
 
-                if (c > 1) {
-                    snprintf(operands, sizeof(operands), "R%u, R%u..R%u, %s", a, b, b + c - 1,
-                             target);
-                } else if (c == 1) {
-                    snprintf(operands, sizeof(operands), "R%u, R%u, %s", a, b, target);
+                if (op == OP_SYSCALL_VOID) {
+                    if (c > 1) {
+                        snprintf(operands, sizeof(operands), "R%u..R%u, %s", b, b + c - 1, target);
+                    } else if (c == 1) {
+                        snprintf(operands, sizeof(operands), "R%u, %s", b, target);
+                    } else {
+                        snprintf(operands, sizeof(operands), "%s", target);
+                    }
+                    snprintf(comment, sizeof(comment), "%s(argc=%u)", target, c);
                 } else {
-                    snprintf(operands, sizeof(operands), "R%u, %s", a, target);
+                    if (c > 1) {
+                        snprintf(operands, sizeof(operands), "R%u, R%u..R%u, %s", a, b, b + c - 1,
+                                 target);
+                    } else if (c == 1) {
+                        snprintf(operands, sizeof(operands), "R%u, R%u, %s", a, b, target);
+                    } else {
+                        snprintf(operands, sizeof(operands), "R%u, %s", a, target);
+                    }
+                    snprintf(comment, sizeof(comment), "R%u = %s(argc=%u)", a, target, c);
                 }
-
-                snprintf(comment, sizeof(comment), "R%u = %s(argc=%u)", a, target, c);
             } else if (op == OP_CALL || op == OP_CALL_VOID || op == OP_TAILCALL) {
-                if (c > 1) {
-                    snprintf(operands, sizeof(operands), "R%u, R%u..R%u, fn_%04u", a, b, b + c - 1,
-                             payload);
-                } else if (c == 1) {
-                    snprintf(operands, sizeof(operands), "R%u, R%u, fn_%04u", a, b, payload);
+                if (op == OP_CALL_VOID || op == OP_TAILCALL) {
+                    if (c > 1) {
+                        snprintf(operands, sizeof(operands), "R%u..R%u, fn_%04u", b, b + c - 1,
+                                 payload);
+                    } else if (c == 1) {
+                        snprintf(operands, sizeof(operands), "R%u, fn_%04u", b, payload);
+                    } else {
+                        snprintf(operands, sizeof(operands), "fn_%04u", payload);
+                    }
                 } else {
-                    snprintf(operands, sizeof(operands), "R%u, fn_%04u", a, payload);
+                    if (c > 1) {
+                        snprintf(operands, sizeof(operands), "R%u, R%u..R%u, fn_%04u", a, b,
+                                 b + c - 1, payload);
+                    } else if (c == 1) {
+                        snprintf(operands, sizeof(operands), "R%u, R%u, fn_%04u", a, b, payload);
+                    } else {
+                        snprintf(operands, sizeof(operands), "R%u, fn_%04u", a, payload);
+                    }
                 }
 
                 if (op == OP_CALL_VOID) {
@@ -328,12 +349,16 @@ u32 AcuDisasm_PrintInstruction(FILE *out, const AcuChunk *chunk, u32 ip) {
         }
 
         case OP_FMT_ABsC: {
-            if (info->side_effect) {
-                u32 target = (u32)((i32)ip + 1 + sc);
-                snprintf(operands, sizeof(operands), "R%u, R%u, .L%04u", a, b, target);
-                const char *sym = AcuDisasm_GetJumpConditionSymbol(op);
-                snprintf(comment, sizeof(comment), "if R%u %s R%u jump -> .L%04u", a, sym, b,
-                         target);
+            if (info->flags & (ACU_FLAG_BRANCH_COND | ACU_FLAG_BRANCH_UNCOND)) {
+                i32 target = (i32)ip + 1 + sc;
+                if (target >= 0) {
+                    snprintf(operands, sizeof(operands), "R%u, R%u, .L%04u", a, b, (u32)target);
+                    const char *sym = AcuDisasm_GetJumpConditionSymbol(op);
+                    snprintf(comment, sizeof(comment), "if R%u %s R%u jump -> .L%04u", a, sym, b,
+                             (u32)target);
+                } else {
+                    snprintf(operands, sizeof(operands), "R%u, R%u, <invalid_%d>", a, b, target);
+                }
             } else {
                 snprintf(operands, sizeof(operands), "R%u, R%u, %d", a, b, sc);
                 if (op == OP_RSUB_IMM) {
@@ -349,18 +374,22 @@ u32 AcuDisasm_PrintInstruction(FILE *out, const AcuChunk *chunk, u32 ip) {
         }
 
         case OP_FMT_AsBsC: {
-            u32 target = (u32)((i32)ip + 1 + sc);
+            i32 target = (i32)ip + 1 + sc;
             const char *sym = AcuDisasm_GetJumpConditionSymbol(op);
             bool is_u = AcuDisasm_IsUnsignedJump(op);
 
-            if (is_u) {
-                snprintf(operands, sizeof(operands), "R%u, %u, .L%04u", a, (u8)b, target);
-                snprintf(comment, sizeof(comment), "if R%u %s %u jump -> .L%04u", a, sym, (u8)b,
-                         target);
+            if (target >= 0) {
+                if (is_u) {
+                    snprintf(operands, sizeof(operands), "R%u, %u, .L%04u", a, (u8)b, (u32)target);
+                    snprintf(comment, sizeof(comment), "if R%u %s %u jump -> .L%04u", a, sym, (u8)b,
+                             (u32)target);
+                } else {
+                    snprintf(operands, sizeof(operands), "R%u, %d, .L%04u", a, sb, (u32)target);
+                    snprintf(comment, sizeof(comment), "if R%u %s %d jump -> .L%04u", a, sym, sb,
+                             (u32)target);
+                }
             } else {
-                snprintf(operands, sizeof(operands), "R%u, %d, .L%04u", a, sb, target);
-                snprintf(comment, sizeof(comment), "if R%u %s %d jump -> .L%04u", a, sym, sb,
-                         target);
+                snprintf(operands, sizeof(operands), "R%u, %d, <invalid_%d>", a, sb, target);
             }
             break;
         }
@@ -390,23 +419,33 @@ u32 AcuDisasm_PrintInstruction(FILE *out, const AcuChunk *chunk, u32 ip) {
                 snprintf(operands, sizeof(operands), "R%u, %d", a, sbx);
                 snprintf(comment, sizeof(comment), "R%u = %d", a, sbx);
             } else if (op == OP_JUMP_IF_FALSE || op == OP_JUMP_IF_TRUE) {
-                u32 target = (u32)((i32)ip + 1 + sbx);
-                snprintf(operands, sizeof(operands), "R%u, .L%04u", a, target);
-                const char *cond_name = (op == OP_JUMP_IF_TRUE) ? "true" : "false";
-                snprintf(comment, sizeof(comment), "jump-%s R%u -> .L%04u", cond_name, a, target);
+                i32 target = (i32)ip + 1 + sbx;
+                if (target >= 0) {
+                    snprintf(operands, sizeof(operands), "R%u, .L%04u", a, (u32)target);
+                    const char *cond_name = (op == OP_JUMP_IF_TRUE) ? "true" : "false";
+                    snprintf(comment, sizeof(comment), "jump-%s R%u -> .L%04u", cond_name, a,
+                             (u32)target);
+                } else {
+                    snprintf(operands, sizeof(operands), "R%u, <invalid_%d>", a, target);
+                }
             }
             break;
 
         case OP_FMT_sAx:
             if (op == OP_JUMP) {
-                u32 target = (u32)((i32)ip + 1 + sax);
-                snprintf(operands, sizeof(operands), ".L%04u", target);
-                snprintf(comment, sizeof(comment), "jump -> .L%04u", target);
+                i32 target = (i32)ip + 1 + sax;
+                if (target >= 0) {
+                    snprintf(operands, sizeof(operands), ".L%04u", (u32)target);
+                    snprintf(comment, sizeof(comment), "jump -> .L%04u", (u32)target);
+                } else {
+                    snprintf(operands, sizeof(operands), "<invalid_%d>", target);
+                }
             }
             break;
     }
 
-    fprintf(out, "%04u  %-16s %-22s", ip, info->name, operands);
+    const char *op_name = info->name ? info->name : "OP_UNKNOWN";
+    fprintf(out, "%04u  %-16s %-22s", ip, op_name, operands);
 
     if (op == OP_LOAD_STR && bx < V_Count(&chunk->constants.constants)) {
         u64 raw = AcuConstantPool_Get(&chunk->constants, bx);
@@ -477,30 +516,41 @@ void AcuDisasm_DumpChunk(FILE *out, const AcuChunk *chunk) {
 
             const AcuOpcodeInfo *info = &g_acu_opcode_info[op];
 
-            if (info->format == OP_FMT_AsBx) {
-                i16 sbx = (i16)(inst >> 16);
-                if (op == OP_JUMP_IF_FALSE || op == OP_JUMP_IF_TRUE) {
-                    u32 target = (u32)((i32)scan_ip + 1 + sbx);
-                    if (target < total_words)
-                        targets[target] |= DISASM_TARGET_JUMP;
+            // 1. Универсальный сбор целей для ВСЕХ типов переходов (обычных и сплавленных)
+            if (info->flags & (ACU_FLAG_BRANCH_COND | ACU_FLAG_BRANCH_UNCOND)) {
+                i32 offset = 0;
+                bool valid = true;
+
+                if (info->format == OP_FMT_sAx) {
+                    offset = (i32)inst >> 8;
+                } else if (info->format == OP_FMT_AsBx) {
+                    offset = (i16)(inst >> 16);
+                } else if (info->format == OP_FMT_ABsC || info->format == OP_FMT_AsBsC) {
+                    offset = (i8)(inst >> 24);
+                } else {
+                    valid = false;
                 }
-            } else if (info->format == OP_FMT_sAx) {
-                i32 sax = (i32)inst >> 8;
-                if (op == OP_JUMP) {
-                    u32 target = (u32)((i32)scan_ip + 1 + sax);
-                    if (target < total_words)
+
+                if (valid) {
+                    i32 target = (i32)scan_ip + 1 + offset;
+                    if (target >= 0 && (u32)target < total_words) {
                         targets[target] |= DISASM_TARGET_JUMP;
+                    }
                 }
-            } else if (info->format == OP_FMT_ABC_WIDE && scan_ip + 1 < total_words) {
-                if (op != OP_SYSCALL) {
+            }
+            // 2. Сбор адресов функций только для реальных инструкций вызова (CALL / TAILCALL)
+            else if (info->format == OP_FMT_ABC_WIDE && scan_ip + 1 < total_words) {
+                if (op == OP_CALL || op == OP_CALL_VOID || op == OP_TAILCALL) {
                     u32 target = (u32)V_At(&chunk->code, scan_ip + 1);
-                    if (target < total_words)
+                    if (target < total_words) {
                         targets[target] |= DISASM_TARGET_CALL;
+                    }
                 }
                 scan_ip += 2;
                 continue;
             }
-            scan_ip++;
+
+            scan_ip += (info->slots > 0) ? info->slots : 1;
         }
     }
 
