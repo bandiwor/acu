@@ -2,5 +2,5 @@ out.acuc
 .cache
 build
 compile_commands.json
-out.acuc
+*.acuc
 
