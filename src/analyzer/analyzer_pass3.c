@@ -10,7 +10,6 @@
 #include "module/module.h"
 #include "table/symbol_table.h"
 #include <assert.h>
-#include <stdio.h>
 #include <string.h>
 
 static bool AcuWorkspace_CanCoerce(TypeId actual, TypeId expected) {
@@ -86,7 +85,7 @@ static TypeId AcuWorkspace_PopLoopContext(AcuWorkspace *ws) {
 }
 
 static TypeId AcuWorkspace_CheckExpr(AcuWorkspace *ws, ScopeId scope, AstNodeIdx expr_idx,
-                                     TypeId expected_type);
+                                     TypeId expected_type, bool is_hint);
 
 #define TYPE_IN_PROGRESS ((TypeId) - 2)
 
@@ -104,14 +103,12 @@ static TypeId AcuWorkspace_EnsureGlobalVarChecked(AcuWorkspace *ws, SymbolId sym
         return sym->type;
     }
 
-    // 2. Обнаружена циклическая зависимость ($a = $b; $b = $a)
     if (sym->flags & ACU_SYMBOL_FLAG_GLOBAL_CHECKING) {
         AcuWorkspace_PushError(ws, sym->decl_node, ACU_ERR_ANALYZER_CYCLIC_DEPENDENCY,
                                (AcuError){0});
         return (sym->type != ACU_NULL_IDX) ? sym->type : TYPE_PRIMITIVE_UNIT;
     }
 
-    // Входим в узел
     sym->flags |= ACU_SYMBOL_FLAG_GLOBAL_CHECKING;
 
     ScopeId var_scope = sym->scope_id;
@@ -125,10 +122,7 @@ static TypeId AcuWorkspace_EnsureGlobalVarChecked(AcuWorkspace *ws, SymbolId sym
                                ? AcuWorkspace_ResolveAstType(ws, var_scope, type_hint)
                                : ACU_NULL_IDX;
 
-    // Рекурсивный обход зависимостей внутри init_expr
-    // Любой идентификатор внутри init_expr вызовет EnsureGlobalVarChecked для зависимостей,
-    // и они добавятся в global_init_order ДО текущей переменной (DFS post-order).
-    TypeId inferred_type = AcuWorkspace_CheckExpr(ws, var_scope, init_expr, expected_type);
+    TypeId inferred_type = AcuWorkspace_CheckExpr(ws, var_scope, init_expr, expected_type, false);
 
     if (unlikely(inferred_type == TYPE_PRIMITIVE_NEVER)) {
         AcuWorkspace_PushError(ws, decl_idx, ACU_ERR_ANALYZER_NEVER_AT_TOP_LEVEL, (AcuError){0});
@@ -147,7 +141,6 @@ static TypeId AcuWorkspace_EnsureGlobalVarChecked(AcuWorkspace *ws, SymbolId sym
     V_At(&ws->node_types, decl_idx) = TYPE_PRIMITIVE_UNIT;
     V_At(&ws->node_analysis, decl_idx).var_decl.sym_id = sym_id;
 
-    // Теперь сюда гарантированно попадут ВСЕ глобальные переменные!
     V_Push(&ws->global_init_order, sym_id);
 
     return final_type;
@@ -255,65 +248,92 @@ static bool AcuWorkspace_IsUntypedNumericExpr(AcuWorkspace *ws, AstNodeIdx expr_
     return false;
 }
 
-static TypeId AcuWorkspace_CheckBinary(AcuWorkspace *ws, ScopeId scope, AstNode *expr,
-                                       AstNodeIdx expr_idx, TypeId expected_type) {
-    AstOperatorCategory category = AstBinaryKind_GetCategory(expr->as.binary.type);
-    TypeId left_expected = ACU_NULL_IDX;
+static inline bool AcuWorkspace_IsValidBinaryOperand(AstBinaryKind op, TypeId type) {
+    AstOperatorCategory category = AstBinaryKind_GetCategory(op);
 
-    if (category == AST_OPERATOR_CATEGORY_ARITHMETIC || category == AST_OPERATOR_CATEGORY_BITWISE) {
-        left_expected = expected_type;
-        if (left_expected == TYPE_PRIMITIVE_UNIT) {
-            left_expected = ACU_NULL_IDX;
-        }
-    } else if (category == AST_OPERATOR_CATEGORY_LOGIC) {
-        left_expected = TYPE_PRIMITIVE_I1;
-    } else if (category == AST_OPERATOR_CATEGORY_COMPARE) {
-        left_expected = ACU_NULL_IDX;
+    switch (category) {
+        case AST_OPERATOR_CATEGORY_ARITHMETIC:
+            return TypePrimitiveKind_IsInteger(type) || TypePrimitiveKind_IsFloat(type);
+
+        case AST_OPERATOR_CATEGORY_BITWISE:
+            return TypePrimitiveKind_IsInteger(type);
+
+        case AST_OPERATOR_CATEGORY_LOGIC:
+            return type == TYPE_PRIMITIVE_I1;
+
+        case AST_OPERATOR_CATEGORY_COMPARE:
+            if (type == TYPE_PRIMITIVE_I1) {
+                return (op == AST_BINARY_EQ || op == AST_BINARY_NEQ);
+            }
+            return TypePrimitiveKind_IsInteger(type) || TypePrimitiveKind_IsFloat(type);
+
+        default:
+            return false;
+    }
+}
+
+static TypeId AcuWorkspace_GetBinaryResultType(AstBinaryKind op, TypeId left_type,
+                                               TypeId right_type) {
+    AstOperatorCategory cat = AstBinaryKind_GetCategory(op);
+
+    if (cat == AST_OPERATOR_CATEGORY_COMPARE || cat == AST_OPERATOR_CATEGORY_LOGIC) {
+        return TYPE_PRIMITIVE_I1;
     }
 
-    bool left_is_untyped = AcuWorkspace_IsUntypedNumericExpr(ws, expr->as.binary.left);
-    bool right_is_untyped = AcuWorkspace_IsUntypedNumericExpr(ws, expr->as.binary.right);
+    if (op == AST_BINARY_SHL || op == AST_BINARY_SHR) {
+        return left_type;
+    }
+
+    if (left_type == right_type) {
+        return left_type;
+    }
+
+    return ACU_NULL_IDX;
+}
+
+static TypeId AcuWorkspace_CheckBinary(AcuWorkspace *ws, ScopeId scope, AstNode *expr,
+                                       AstNodeIdx expr_idx, TypeId expected_type) {
+    AstBinaryKind op = expr->as.binary.type;
+    AstNodeIdx left_idx = expr->as.binary.left;
+    AstNodeIdx right_idx = expr->as.binary.right;
+    AstOperatorCategory category = AstBinaryKind_GetCategory(op);
+
+    TypeId left_expected = ACU_NULL_IDX;
+    if (category == AST_OPERATOR_CATEGORY_ARITHMETIC || category == AST_OPERATOR_CATEGORY_BITWISE) {
+        left_expected = (expected_type != TYPE_PRIMITIVE_UNIT) ? expected_type : ACU_NULL_IDX;
+    } else if (category == AST_OPERATOR_CATEGORY_LOGIC) {
+        left_expected = TYPE_PRIMITIVE_I1;
+    }
+
+    bool left_is_untyped = AcuWorkspace_IsUntypedNumericExpr(ws, left_idx);
+    bool right_is_untyped = AcuWorkspace_IsUntypedNumericExpr(ws, right_idx);
 
     TypeId left_type = TYPE_PRIMITIVE_UNIT;
     TypeId right_type = TYPE_PRIMITIVE_UNIT;
 
     if (left_is_untyped && !right_is_untyped) {
-        right_type = AcuWorkspace_CheckExpr(ws, scope, expr->as.binary.right, left_expected);
-
+        right_type = AcuWorkspace_CheckExpr(ws, scope, right_idx, left_expected, true);
         TypeId expected_for_left = (left_expected != ACU_NULL_IDX) ? left_expected : right_type;
-        left_type = AcuWorkspace_CheckExpr(ws, scope, expr->as.binary.left, expected_for_left);
+        left_type = AcuWorkspace_CheckExpr(ws, scope, left_idx, expected_for_left, true);
     } else {
-        // Стандартный обход слева направо
-        left_type = AcuWorkspace_CheckExpr(ws, scope, expr->as.binary.left, left_expected);
-        right_type = AcuWorkspace_CheckExpr(ws, scope, expr->as.binary.right, left_type);
+        left_type = AcuWorkspace_CheckExpr(ws, scope, left_idx, left_expected, true);
+        TypeId right_expected =
+            (category == AST_OPERATOR_CATEGORY_LOGIC) ? TYPE_PRIMITIVE_I1 : left_type;
+        right_type = AcuWorkspace_CheckExpr(ws, scope, right_idx, right_expected, true);
     }
 
-    if (unlikely(left_type == TYPE_PRIMITIVE_NEVER || right_type == TYPE_PRIMITIVE_NEVER)) {
+    if (left_type == TYPE_PRIMITIVE_NEVER || right_type == TYPE_PRIMITIVE_NEVER) {
         return TYPE_PRIMITIVE_NEVER;
     }
 
-    if (unlikely(left_type != right_type)) {
-        AcuError err = {.as.type_mismatch = {.expected = left_type, .actual = right_type}};
-        AcuWorkspace_PushError(ws, expr_idx, ACU_ERR_ANALYZER_TYPE_MISMATCH, err);
-        return left_type;
+    if (unlikely(left_type == ACU_NULL_IDX || right_type == ACU_NULL_IDX)) {
+        return (category == AST_OPERATOR_CATEGORY_COMPARE ||
+                category == AST_OPERATOR_CATEGORY_LOGIC)
+                   ? TYPE_PRIMITIVE_I1
+                   : ACU_NULL_IDX;
     }
 
-    bool is_valid_op = false;
-    if (category == AST_OPERATOR_CATEGORY_LOGIC) {
-        is_valid_op = (left_type == TYPE_PRIMITIVE_I1);
-    } else if (category == AST_OPERATOR_CATEGORY_COMPARE) {
-        is_valid_op =
-            (bool)(left_type == TYPE_PRIMITIVE_I1 || TypePrimitiveKind_IsInteger(left_type) ||
-                   TypePrimitiveKind_IsFloat(left_type));
-    } else if (category == AST_OPERATOR_CATEGORY_ARITHMETIC) {
-        is_valid_op =
-            (bool)(TypePrimitiveKind_IsInteger(left_type) || TypePrimitiveKind_IsFloat(left_type));
-    } else if (category == AST_OPERATOR_CATEGORY_BITWISE) {
-        is_valid_op =
-            (bool)(left_type == TYPE_PRIMITIVE_I1 || TypePrimitiveKind_IsInteger(left_type));
-    }
-
-    if (unlikely(!is_valid_op)) {
+    if (unlikely(!AcuWorkspace_IsValidBinaryOperand(op, left_type))) {
         AcuWorkspace_PushError(ws, expr_idx, ACU_ERR_ANALYZER_UNSUPPORTED_OPERATION, (AcuError){0});
         return (category == AST_OPERATOR_CATEGORY_COMPARE ||
                 category == AST_OPERATOR_CATEGORY_LOGIC)
@@ -321,11 +341,19 @@ static TypeId AcuWorkspace_CheckBinary(AcuWorkspace *ws, ScopeId scope, AstNode 
                    : left_type;
     }
 
-    if (category == AST_OPERATOR_CATEGORY_COMPARE || category == AST_OPERATOR_CATEGORY_LOGIC) {
-        return TYPE_PRIMITIVE_I1;
+    TypeId result_type = AcuWorkspace_GetBinaryResultType(op, left_type, right_type);
+
+    if (unlikely(result_type == ACU_NULL_IDX)) {
+        AcuError err = {.as.type_mismatch = {.expected = left_type, .actual = right_type}};
+        AcuWorkspace_PushError(ws, expr_idx, ACU_ERR_ANALYZER_TYPE_MISMATCH, err);
+
+        return (category == AST_OPERATOR_CATEGORY_COMPARE ||
+                category == AST_OPERATOR_CATEGORY_LOGIC)
+                   ? TYPE_PRIMITIVE_I1
+                   : left_type;
     }
 
-    return left_type;
+    return result_type;
 }
 
 static TypeId AcuWorkspace_CheckBlock(AcuWorkspace *ws, ScopeId scope, AstNode *expr,
@@ -345,9 +373,9 @@ static TypeId AcuWorkspace_CheckBlock(AcuWorkspace *ws, ScopeId scope, AstNode *
         AstNodeIdx stmt_idx = AcuAstBuilder_GetIdxByExtra(ws->builder, current + i);
 
         bool is_last = (i == count - 1);
-        TypeId stmt_expected = (int)is_last ? expected_type : ACU_NULL_IDX;
+        TypeId stmt_expected = is_last ? expected_type : ACU_NULL_IDX;
 
-        TypeId stmt_type = AcuWorkspace_CheckExpr(ws, inner_scope, stmt_idx, stmt_expected);
+        TypeId stmt_type = AcuWorkspace_CheckExpr(ws, inner_scope, stmt_idx, stmt_expected, false);
 
         if (stmt_type == TYPE_PRIMITIVE_NEVER) {
             has_never = true;
@@ -356,7 +384,8 @@ static TypeId AcuWorkspace_CheckBlock(AcuWorkspace *ws, ScopeId scope, AstNode *
         if (is_last) {
             block_type = stmt_type;
         } else {
-            if (unlikely(stmt_type != TYPE_PRIMITIVE_UNIT && stmt_type != TYPE_PRIMITIVE_NEVER)) {
+            if (unlikely(stmt_type != TYPE_PRIMITIVE_UNIT && stmt_type != TYPE_PRIMITIVE_NEVER &&
+                         stmt_type != ACU_NULL_IDX)) {
                 AcuError err = {
                     .as.type_mismatch = {.expected = TYPE_PRIMITIVE_UNIT, .actual = stmt_type}};
                 AcuWorkspace_PushError(ws, stmt_idx, ACU_ERR_ANALYZER_EXPECTED_UNIT, err);
@@ -368,80 +397,112 @@ static TypeId AcuWorkspace_CheckBlock(AcuWorkspace *ws, ScopeId scope, AstNode *
         return TYPE_PRIMITIVE_NEVER;
     }
 
-    return (count > 0) ? block_type : TYPE_PRIMITIVE_UNIT;
+    return block_type;
 }
 
 static TypeId AcuWorkspace_CheckIf(AcuWorkspace *ws, ScopeId scope, AstNode *expr,
                                    AstNodeIdx expr_idx, TypeId expected_type) {
     TypeId cond_type =
-        AcuWorkspace_CheckExpr(ws, scope, expr->as.if_stmt.condition, TYPE_PRIMITIVE_I1);
-    if (unlikely(!AcuWorkspace_CanCoerce(cond_type, TYPE_PRIMITIVE_I1))) {
+        AcuWorkspace_CheckExpr(ws, scope, expr->as.if_stmt.condition, TYPE_PRIMITIVE_I1, true);
+
+    if (unlikely(cond_type != ACU_NULL_IDX &&
+                 !AcuWorkspace_CanCoerce(cond_type, TYPE_PRIMITIVE_I1))) {
         AcuError err = {.as.type_mismatch = {.expected = TYPE_PRIMITIVE_I1, .actual = cond_type}};
         AcuWorkspace_PushError(ws, expr->as.if_stmt.condition, ACU_ERR_ANALYZER_CONDITION_NOT_BOOL,
                                err);
     }
 
     bool has_else = (expr->as.if_stmt.else_body != ACU_NULL_IDX);
-    TypeId then_expected = (int)has_else ? expected_type : ACU_NULL_IDX;
-    if (then_expected == TYPE_PRIMITIVE_UNIT)
-        then_expected = ACU_NULL_IDX;
 
-    TypeId then_type = AcuWorkspace_CheckExpr(ws, scope, expr->as.if_stmt.then_body, then_expected);
+    TypeId target_hint = (expected_type != TYPE_PRIMITIVE_UNIT) ? expected_type : ACU_NULL_IDX;
+    TypeId then_expected = has_else ? target_hint : ACU_NULL_IDX;
+
+    TypeId then_type =
+        AcuWorkspace_CheckExpr(ws, scope, expr->as.if_stmt.then_body, then_expected, true);
 
     if (has_else) {
-        TypeId else_expected = (then_type == TYPE_PRIMITIVE_NEVER) ? expected_type : then_type;
-        if (else_expected == TYPE_PRIMITIVE_UNIT)
-            else_expected = ACU_NULL_IDX;
+        TypeId else_expected = target_hint;
+        if (else_expected == ACU_NULL_IDX && then_type != TYPE_PRIMITIVE_NEVER &&
+            then_type != TYPE_PRIMITIVE_UNIT) {
+            else_expected = then_type;
+        }
 
         TypeId else_type =
-            AcuWorkspace_CheckExpr(ws, scope, expr->as.if_stmt.else_body, else_expected);
+            AcuWorkspace_CheckExpr(ws, scope, expr->as.if_stmt.else_body, else_expected, true);
 
-        if (then_type == TYPE_PRIMITIVE_NEVER && else_type == TYPE_PRIMITIVE_NEVER)
+        if (cond_type == TYPE_PRIMITIVE_NEVER) {
             return TYPE_PRIMITIVE_NEVER;
-        if (then_type == TYPE_PRIMITIVE_NEVER)
-            return else_type;
-        if (else_type == TYPE_PRIMITIVE_NEVER)
-            return then_type;
+        }
 
-        if (AcuWorkspace_CanCoerce(else_type, then_type))
-            return then_type;
-
-        if (AcuWorkspace_CanCoerce(then_type, else_type))
+        if (then_type == TYPE_PRIMITIVE_NEVER && else_type == TYPE_PRIMITIVE_NEVER) {
+            return TYPE_PRIMITIVE_NEVER;
+        }
+        if (then_type == TYPE_PRIMITIVE_NEVER) {
             return else_type;
+        }
+        if (else_type == TYPE_PRIMITIVE_NEVER) {
+            return then_type;
+        }
+
+        if (then_type == ACU_NULL_IDX || else_type == ACU_NULL_IDX) {
+            return (target_hint != ACU_NULL_IDX) ? target_hint
+                   : (then_type != ACU_NULL_IDX) ? then_type
+                                                 : else_type;
+        }
+
+        if (AcuWorkspace_CanCoerce(else_type, then_type)) {
+            return then_type;
+        }
+        if (AcuWorkspace_CanCoerce(then_type, else_type)) {
+            return else_type;
+        }
 
         AcuError err = {.as.type_mismatch = {.expected = then_type, .actual = else_type}};
-        AcuWorkspace_PushError(ws, expr_idx, ACU_ERR_ANALYZER_BRANCH_TYPE_MISMATCH, err);
+        AcuWorkspace_PushError(ws, expr->as.if_stmt.else_body,
+                               ACU_ERR_ANALYZER_BRANCH_TYPE_MISMATCH, err);
 
-        return expected_type != ACU_NULL_IDX ? expected_type : then_type;
+        return (expected_type != ACU_NULL_IDX) ? expected_type : then_type;
     }
 
-    if (unlikely(then_type != TYPE_PRIMITIVE_UNIT && then_type != TYPE_PRIMITIVE_NEVER)) {
+    if (cond_type == TYPE_PRIMITIVE_NEVER) {
+        return TYPE_PRIMITIVE_NEVER;
+    }
+
+    if (unlikely(then_type != TYPE_PRIMITIVE_UNIT && then_type != TYPE_PRIMITIVE_NEVER &&
+                 then_type != ACU_NULL_IDX)) {
         AcuError err = {.as.type_mismatch = {.expected = TYPE_PRIMITIVE_UNIT, .actual = then_type}};
         AcuWorkspace_PushError(ws, expr_idx, ACU_ERR_ANALYZER_IF_WITHOUT_ELSE_NOT_UNIT, err);
     }
 
-    return cond_type == TYPE_PRIMITIVE_NEVER ? TYPE_PRIMITIVE_NEVER : TYPE_PRIMITIVE_UNIT;
+    return TYPE_PRIMITIVE_UNIT;
 }
 
 static TypeId AcuWorkspace_CheckCall(AcuWorkspace *ws, ScopeId scope, AstNode *expr,
                                      AstNodeIdx expr_idx) {
     AstNodeIdx callee_idx = expr->as.call.object;
+    if (unlikely(callee_idx == ACU_NULL_IDX)) {
+        return TYPE_PRIMITIVE_UNIT;
+    }
 
-    TypeId callee_type_id = AcuWorkspace_CheckExpr(ws, scope, callee_idx, ACU_NULL_IDX);
+    TypeId callee_type_id = AcuWorkspace_CheckExpr(ws, scope, callee_idx, ACU_NULL_IDX, false);
 
-    SymbolId callee_sym = V_At(&ws->node_analysis, callee_idx).reference.resolved_sym;
     SymbolId resolved_fn = ACU_NULL_IDX;
+    AstNode *callee_node = AcuAstBuilder_GetNode(ws->builder, callee_idx);
 
-    if (callee_sym != ACU_NULL_IDX) {
-        AcuSymbol *sym = AcuSymbolTable_Get(ws->symbols, callee_sym);
-        if (sym && (sym->kind == ACU_SYMBOL_FUNCTION || sym->kind == ACU_SYMBOL_SYSTEM_FUNCTION)) {
-            resolved_fn = callee_sym;
+    if (callee_node->type == AST_IDENTIFIER || callee_node->type == AST_DOT) {
+        SymbolId callee_sym = V_At(&ws->node_analysis, callee_idx).reference.resolved_sym;
+        if (callee_sym != ACU_NULL_IDX) {
+            AcuSymbol *sym = AcuSymbolTable_Get(ws->symbols, callee_sym);
+            if (sym &&
+                (sym->kind == ACU_SYMBOL_FUNCTION || sym->kind == ACU_SYMBOL_SYSTEM_FUNCTION)) {
+                resolved_fn = callee_sym;
+            }
         }
     }
 
     bool is_callee_never = (callee_type_id == TYPE_PRIMITIVE_NEVER);
     bool is_callee_err = (callee_type_id == ACU_NULL_IDX);
-    bool is_valid_func = false;
+    bool is_func = false;
 
     u32 param_count = 0;
     TypeId return_type = TYPE_PRIMITIVE_UNIT;
@@ -453,7 +514,7 @@ static TypeId AcuWorkspace_CheckCall(AcuWorkspace *ws, ScopeId scope, AstNode *e
             AcuWorkspace_PushError(ws, callee_idx, ACU_ERR_ANALYZER_CALL_NON_FUNCTION,
                                    (AcuError){0});
         } else {
-            is_valid_func = true;
+            is_func = true;
             param_count = callee_type->as.func.count;
             return_type = callee_type->as.func.return_type;
             params_start_extra = callee_type->as.func.params_start;
@@ -461,11 +522,11 @@ static TypeId AcuWorkspace_CheckCall(AcuWorkspace *ws, ScopeId scope, AstNode *e
     }
 
     u32 arg_count = expr->as.call.arguments_count;
-    if (is_valid_func && arg_count != param_count) {
+    bool arity_matches = is_func && (arg_count == param_count);
+
+    if (is_func && unlikely(arg_count != param_count)) {
         AcuError err = {.as.arg_count = {.expected = param_count, .actual = arg_count}};
         AcuWorkspace_PushError(ws, expr_idx, ACU_ERR_ANALYZER_WRONG_ARGUMENT_COUNT, err);
-
-        is_valid_func = false;
         resolved_fn = ACU_NULL_IDX;
     }
 
@@ -480,22 +541,27 @@ static TypeId AcuWorkspace_CheckCall(AcuWorkspace *ws, ScopeId scope, AstNode *e
         TypeId expected_arg_type = ACU_NULL_IDX;
         TypeId sig_param_type = ACU_NULL_IDX;
 
-        if (is_valid_func && i < param_count) {
+        if (arity_matches) {
             sig_param_type = AcuTypeInterner_GetTypeIdByExtra(ws->types, params_start_extra + i);
-            expected_arg_type =
-                (sig_param_type == TYPE_PRIMITIVE_UNIT) ? ACU_NULL_IDX : sig_param_type;
+            expected_arg_type = sig_param_type;
         }
 
-        TypeId arg_type = AcuWorkspace_CheckExpr(ws, scope, arg_ast, expected_arg_type);
-        if (unlikely(arg_type == TYPE_PRIMITIVE_NEVER)) {
+        TypeId arg_type = AcuWorkspace_CheckExpr(ws, scope, arg_ast, expected_arg_type, true);
+
+        if (arg_type == TYPE_PRIMITIVE_NEVER) {
             has_never = true;
         }
 
-        if (is_valid_func && i < param_count) {
+        if (arity_matches) {
             if (unlikely(arg_type != ACU_NULL_IDX &&
                          !AcuWorkspace_CanCoerce(arg_type, sig_param_type))) {
                 AcuError err = {
-                    .as.type_mismatch = {.expected = sig_param_type, .actual = arg_type}};
+                    .as.type_mismatch =
+                        {
+                            .expected = sig_param_type,
+                            .actual = arg_type,
+                        },
+                };
                 AcuWorkspace_PushError(ws, arg_ast, ACU_ERR_ANALYZER_TYPE_MISMATCH, err);
             }
         }
@@ -504,11 +570,12 @@ static TypeId AcuWorkspace_CheckCall(AcuWorkspace *ws, ScopeId scope, AstNode *e
     if (has_never) {
         return TYPE_PRIMITIVE_NEVER;
     }
-    if (is_valid_func) {
+
+    if (is_func) {
         return return_type;
     }
 
-    return TYPE_PRIMITIVE_UNIT;
+    return is_callee_err ? ACU_NULL_IDX : TYPE_PRIMITIVE_UNIT;
 }
 
 static TypeId AcuWorkspace_CheckVarDecl(AcuWorkspace *ws, ScopeId scope, AstNode *expr,
@@ -520,31 +587,32 @@ static TypeId AcuWorkspace_CheckVarDecl(AcuWorkspace *ws, ScopeId scope, AstNode
                               ? AcuWorkspace_ResolveAstType(ws, scope, type_hint)
                               : ACU_NULL_IDX;
 
-    TypeId init_type = AcuWorkspace_CheckExpr(ws, scope, init_expr, var_expected);
+    TypeId init_type = AcuWorkspace_CheckExpr(ws, scope, init_expr, var_expected, false);
 
     TypeId final_type = (var_expected != ACU_NULL_IDX) ? var_expected : init_type;
 
-    SymbolId sym_id =
-        AcuSymbolTable_AddLocalVar(ws->symbols, scope, expr->as.var_decl.name, final_type, expr_idx,
-                                   (bool)(expr->flags & AST_FLAG_MUTABLE));
+    if (unlikely(final_type == ACU_NULL_IDX)) {
+        final_type = TYPE_PRIMITIVE_UNIT;
+    }
+
+    bool is_mutable = (expr->flags & AST_FLAG_MUTABLE) != 0;
+    SymbolId sym_id = AcuSymbolTable_AddLocalVar(ws->symbols, scope, expr->as.var_decl.name,
+                                                 final_type, expr_idx, is_mutable);
 
     V_At(&ws->node_analysis, expr_idx).var_decl.sym_id = sym_id;
+    V_At(&ws->node_types, expr_idx) = TYPE_PRIMITIVE_UNIT;
 
-    return init_type == TYPE_PRIMITIVE_NEVER ? TYPE_PRIMITIVE_NEVER : TYPE_PRIMITIVE_UNIT;
+    return (init_type == TYPE_PRIMITIVE_NEVER) ? TYPE_PRIMITIVE_NEVER : TYPE_PRIMITIVE_UNIT;
 }
 
 static TypeId AcuWorkspace_CheckDiscard(AcuWorkspace *ws, ScopeId scope, AstNode *expr) {
-    TypeId inner_type = AcuWorkspace_CheckExpr(ws, scope, expr->as.discard.expr, ACU_NULL_IDX);
+    TypeId inner_type =
+        AcuWorkspace_CheckExpr(ws, scope, expr->as.discard.expr, ACU_NULL_IDX, false);
+
     return inner_type == TYPE_PRIMITIVE_NEVER ? TYPE_PRIMITIVE_NEVER : TYPE_PRIMITIVE_UNIT;
 }
 
-static TypeId AcuWorkspace_CheckUnit(AcuWorkspace *ws, TypeId expected_type, AstNodeIdx expr_idx) {
-    if (unlikely(expected_type != ACU_NULL_IDX && expected_type != TYPE_PRIMITIVE_UNIT)) {
-        AcuError err = {
-            .as.type_mismatch = {.expected = expected_type, .actual = TYPE_PRIMITIVE_UNIT}};
-        AcuWorkspace_PushError(ws, expr_idx, ACU_ERR_ANALYZER_TYPE_MISMATCH, err);
-    }
-
+static TypeId AcuWorkspace_CheckUnit(void) {
     return TYPE_PRIMITIVE_UNIT;
 }
 
@@ -556,16 +624,18 @@ static TypeId AcuWorkspace_CheckUnary(AcuWorkspace *ws, ScopeId scope, AstNode *
     if (cat == AST_OPERATOR_CATEGORY_LOGIC) {
         operand_expected = TYPE_PRIMITIVE_I1;
     } else {
-        operand_expected = expected_type;
-        if (operand_expected == TYPE_PRIMITIVE_UNIT) {
-            operand_expected = ACU_NULL_IDX;
-        }
+        operand_expected = (expected_type != TYPE_PRIMITIVE_UNIT) ? expected_type : ACU_NULL_IDX;
     }
 
-    TypeId operand_type = AcuWorkspace_CheckExpr(ws, scope, expr->as.unary.right, operand_expected);
+    TypeId operand_type =
+        AcuWorkspace_CheckExpr(ws, scope, expr->as.unary.right, operand_expected, true);
 
-    if (unlikely(operand_type == TYPE_PRIMITIVE_NEVER)) {
+    if (operand_type == TYPE_PRIMITIVE_NEVER) {
         return TYPE_PRIMITIVE_NEVER;
+    }
+
+    if (unlikely(operand_type == ACU_NULL_IDX)) {
+        return (cat == AST_OPERATOR_CATEGORY_LOGIC) ? TYPE_PRIMITIVE_I1 : ACU_NULL_IDX;
     }
 
     bool is_valid_op = false;
@@ -584,43 +654,45 @@ static TypeId AcuWorkspace_CheckUnary(AcuWorkspace *ws, ScopeId scope, AstNode *
         return (cat == AST_OPERATOR_CATEGORY_LOGIC) ? TYPE_PRIMITIVE_I1 : operand_type;
     }
 
-    if (cat == AST_OPERATOR_CATEGORY_LOGIC) {
-        return TYPE_PRIMITIVE_I1;
-    }
-
     return operand_type;
 }
 
 static TypeId AcuWorkspace_CheckLoop(AcuWorkspace *ws, ScopeId scope, AstNode *expr,
-                                     AstNodeIdx expr_idx, TypeId expected_type) {
+                                     TypeId expected_type) {
     AcuWorkspace_PushLoopContext(ws, AST_LOOP, expected_type);
 
-    TypeId body_type = AcuWorkspace_CheckExpr(ws, scope, expr->as.loop_stmt.body, ACU_NULL_IDX);
-    if (unlikely(body_type != TYPE_PRIMITIVE_UNIT && body_type != TYPE_PRIMITIVE_NEVER)) {
+    AstNodeIdx body_idx = expr->as.loop_stmt.body;
+    TypeId body_type = AcuWorkspace_CheckExpr(ws, scope, body_idx, ACU_NULL_IDX, false);
+
+    if (unlikely(body_type != TYPE_PRIMITIVE_UNIT && body_type != TYPE_PRIMITIVE_NEVER &&
+                 body_type != ACU_NULL_IDX)) {
         AcuError err = {.as.type_mismatch = {.expected = TYPE_PRIMITIVE_UNIT, .actual = body_type}};
-        AcuWorkspace_PushError(ws, expr_idx, ACU_ERR_ANALYZER_EXPECTED_UNIT, err);
+        AcuWorkspace_PushError(ws, body_idx, ACU_ERR_ANALYZER_EXPECTED_UNIT, err);
     }
 
     return AcuWorkspace_PopLoopContext(ws);
 }
 
-static TypeId AcuWorkspace_CheckWhile(AcuWorkspace *ws, ScopeId scope, AstNode *expr,
-                                      AstNodeIdx expr_idx) {
-    TypeId cond_type =
-        AcuWorkspace_CheckExpr(ws, scope, expr->as.while_stmt.condition, TYPE_PRIMITIVE_I1);
+static TypeId AcuWorkspace_CheckWhile(AcuWorkspace *ws, ScopeId scope, AstNode *expr) {
+    AstNodeIdx cond_idx = expr->as.while_stmt.condition;
 
-    if (unlikely(!AcuWorkspace_CanCoerce(cond_type, TYPE_PRIMITIVE_I1))) {
+    TypeId cond_type = AcuWorkspace_CheckExpr(ws, scope, cond_idx, TYPE_PRIMITIVE_I1, true);
+
+    if (unlikely(cond_type != ACU_NULL_IDX &&
+                 !AcuWorkspace_CanCoerce(cond_type, TYPE_PRIMITIVE_I1))) {
         AcuError err = {.as.type_mismatch = {.expected = TYPE_PRIMITIVE_I1, .actual = cond_type}};
-        AcuWorkspace_PushError(ws, expr->as.while_stmt.condition,
-                               ACU_ERR_ANALYZER_CONDITION_NOT_BOOL, err);
+        AcuWorkspace_PushError(ws, cond_idx, ACU_ERR_ANALYZER_CONDITION_NOT_BOOL, err);
     }
 
     AcuWorkspace_PushLoopContext(ws, AST_WHILE, ACU_NULL_IDX);
 
-    TypeId body_type = AcuWorkspace_CheckExpr(ws, scope, expr->as.while_stmt.body, ACU_NULL_IDX);
-    if (unlikely(body_type != TYPE_PRIMITIVE_UNIT && body_type != TYPE_PRIMITIVE_NEVER)) {
+    AstNodeIdx body_idx = expr->as.while_stmt.body;
+    TypeId body_type = AcuWorkspace_CheckExpr(ws, scope, body_idx, ACU_NULL_IDX, false);
+
+    if (unlikely(body_type != TYPE_PRIMITIVE_UNIT && body_type != TYPE_PRIMITIVE_NEVER &&
+                 body_type != ACU_NULL_IDX)) {
         AcuError err = {.as.type_mismatch = {.expected = TYPE_PRIMITIVE_UNIT, .actual = body_type}};
-        AcuWorkspace_PushError(ws, expr_idx, ACU_ERR_ANALYZER_EXPECTED_UNIT, err);
+        AcuWorkspace_PushError(ws, body_idx, ACU_ERR_ANALYZER_EXPECTED_UNIT, err);
     }
 
     AcuWorkspace_PopLoopContext(ws);
@@ -634,14 +706,20 @@ static TypeId AcuWorkspace_CheckWhile(AcuWorkspace *ws, ScopeId scope, AstNode *
 
 static ModuleId AcuWorkspace_GetModuleFromExpr(AcuWorkspace *ws, ScopeId scope,
                                                AstNodeIdx expr_idx) {
+    if (unlikely(expr_idx == ACU_NULL_IDX)) {
+        return ACU_NULL_IDX;
+    }
+
     AstNode *expr = AcuAstBuilder_GetNode(ws->builder, expr_idx);
 
     if (expr->type == AST_IDENTIFIER) {
         StringId name = expr->as.identifier.name;
         SymbolId sym_id = AcuSymbolTable_Lookup(ws->symbols, scope, name);
+
         if (sym_id != ACU_NULL_IDX) {
             AcuSymbol *sym = AcuSymbolTable_Get(ws->symbols, sym_id);
-            if (sym->kind == ACU_SYMBOL_MODULE) {
+            if (sym && sym->kind == ACU_SYMBOL_MODULE) {
+                V_At(&ws->node_analysis, expr_idx).reference.resolved_sym = sym_id;
                 return sym->as.target_module_id;
             }
         }
@@ -649,20 +727,33 @@ static ModuleId AcuWorkspace_GetModuleFromExpr(AcuWorkspace *ws, ScopeId scope,
     }
 
     if (expr->type == AST_DOT) {
-        ModuleId parent_mod = AcuWorkspace_GetModuleFromExpr(ws, scope, expr->as.dot.object);
-        if (parent_mod != ACU_NULL_IDX) {
-            ScopeId target_scope = AcuModuleManager_GetModuleScope(ws->modules, parent_mod);
-            AstNode *member_node = AcuAstBuilder_GetNode(ws->builder, expr->as.dot.member);
+        AstNodeIdx object_idx = expr->as.dot.object;
+        AstNodeIdx member_idx = expr->as.dot.member;
 
-            if (member_node->type == AST_IDENTIFIER) {
-                StringId name = member_node->as.identifier.name;
-                SymbolId sym_id = AcuSymbolTable_LookupExact(ws->symbols, target_scope, name);
+        if (unlikely(object_idx == ACU_NULL_IDX || member_idx == ACU_NULL_IDX)) {
+            return ACU_NULL_IDX;
+        }
 
-                if (sym_id != ACU_NULL_IDX) {
-                    AcuSymbol *sym = AcuSymbolTable_Get(ws->symbols, sym_id);
-                    if (sym->kind == ACU_SYMBOL_MODULE) {
-                        return sym->as.target_module_id;
-                    }
+        ModuleId parent_mod = AcuWorkspace_GetModuleFromExpr(ws, scope, object_idx);
+        if (parent_mod == ACU_NULL_IDX) {
+            return ACU_NULL_IDX;
+        }
+
+        ScopeId target_scope = AcuModuleManager_GetModuleScope(ws->modules, parent_mod);
+        if (unlikely(target_scope == ACU_NULL_IDX)) {
+            return ACU_NULL_IDX;
+        }
+
+        AstNode *member_node = AcuAstBuilder_GetNode(ws->builder, member_idx);
+        if (member_node->type == AST_IDENTIFIER) {
+            StringId name = member_node->as.identifier.name;
+            SymbolId sym_id = AcuSymbolTable_LookupExact(ws->symbols, target_scope, name);
+
+            if (sym_id != ACU_NULL_IDX) {
+                AcuSymbol *sym = AcuSymbolTable_Get(ws->symbols, sym_id);
+                if (sym && sym->kind == ACU_SYMBOL_MODULE) {
+                    V_At(&ws->node_analysis, member_idx).reference.resolved_sym = sym_id;
+                    return sym->as.target_module_id;
                 }
             }
         }
@@ -671,98 +762,193 @@ static ModuleId AcuWorkspace_GetModuleFromExpr(AcuWorkspace *ws, ScopeId scope,
     return ACU_NULL_IDX;
 }
 
+typedef struct {
+    bool is_lvalue;
+    bool is_mutable;
+} AcuLValueStatus;
+
+static AcuLValueStatus AcuWorkspace_GetLValueStatus(AcuWorkspace *ws, AstNodeIdx expr_idx) {
+    if (unlikely(expr_idx == ACU_NULL_IDX)) {
+        return (AcuLValueStatus){.is_lvalue = false, .is_mutable = false};
+    }
+
+    AstNode *node = AcuAstBuilder_GetNode(ws->builder, expr_idx);
+
+    switch (node->type) {
+        case AST_IDENTIFIER: {
+            SymbolId sym_id = V_At(&ws->node_analysis, expr_idx).reference.resolved_sym;
+            if (sym_id == ACU_NULL_IDX) {
+                return (AcuLValueStatus){.is_lvalue = true, .is_mutable = true};
+            }
+
+            AcuSymbol *sym = AcuSymbolTable_Get(ws->symbols, sym_id);
+            bool is_var = (sym->kind == ACU_SYMBOL_LOCAL_VAR || sym->kind == ACU_SYMBOL_GLOBAL_VAR);
+            if (!is_var) {
+                return (AcuLValueStatus){.is_lvalue = false, .is_mutable = false};
+            }
+
+            return (AcuLValueStatus){
+                .is_lvalue = true,
+                .is_mutable = (sym->flags & ACU_SYMBOL_FLAG_MUTABLE) != 0,
+            };
+        }
+
+        case AST_DOT: {
+            AstNodeIdx obj_idx = node->as.dot.object;
+            AstNodeIdx member_idx = node->as.dot.member;
+            TypeId obj_type = V_At(&ws->node_types, obj_idx);
+
+            if (obj_type == TYPE_PRIMITIVE_MODULE) {
+                SymbolId sym_id = V_At(&ws->node_analysis, member_idx).reference.resolved_sym;
+                if (sym_id == ACU_NULL_IDX) {
+                    return (AcuLValueStatus){.is_lvalue = true, .is_mutable = true};
+                }
+
+                AcuSymbol *sym = AcuSymbolTable_Get(ws->symbols, sym_id);
+                if (sym->kind != ACU_SYMBOL_GLOBAL_VAR) {
+                    return (AcuLValueStatus){.is_lvalue = false, .is_mutable = false};
+                }
+
+                return (AcuLValueStatus){
+                    .is_lvalue = true,
+                    .is_mutable = (sym->flags & ACU_SYMBOL_FLAG_MUTABLE) != 0,
+                };
+            }
+
+            return AcuWorkspace_GetLValueStatus(ws, obj_idx);
+        }
+
+        default:
+            return (AcuLValueStatus){.is_lvalue = false, .is_mutable = false};
+    }
+}
+
 static TypeId AcuWorkspace_CheckDot(AcuWorkspace *ws, ScopeId scope, AstNode *expr,
                                     AstNodeIdx expr_idx) {
     AstNodeIdx obj_idx = expr->as.dot.object;
     AstNodeIdx member_idx = expr->as.dot.member;
 
-    TypeId obj_type = AcuWorkspace_CheckExpr(ws, scope, obj_idx, ACU_NULL_IDX);
+    assert(obj_idx != ACU_NULL_IDX && member_idx != ACU_NULL_IDX);
 
-    if (unlikely(obj_type == TYPE_PRIMITIVE_NEVER)) {
+    TypeId obj_type = AcuWorkspace_CheckExpr(ws, scope, obj_idx, ACU_NULL_IDX, false);
+    if (obj_type == TYPE_PRIMITIVE_NEVER) {
+        V_At(&ws->node_types, expr_idx) = TYPE_PRIMITIVE_NEVER;
         return TYPE_PRIMITIVE_NEVER;
+    }
+
+    if (unlikely(obj_type == ACU_NULL_IDX)) {
+        V_At(&ws->node_types, expr_idx) = ACU_NULL_IDX;
+        return ACU_NULL_IDX;
     }
 
     if (obj_type == TYPE_PRIMITIVE_MODULE) {
         ModuleId target_mod_id = AcuWorkspace_GetModuleFromExpr(ws, scope, obj_idx);
-
         if (unlikely(target_mod_id == ACU_NULL_IDX)) {
             AcuWorkspace_PushError(ws, obj_idx, ACU_ERR_ANALYZER_EXPECTED_MODULE_BEFORE_DOT,
                                    (AcuError){0});
-            return TYPE_PRIMITIVE_UNIT;
+            V_At(&ws->node_types, expr_idx) = ACU_NULL_IDX;
+            return ACU_NULL_IDX;
         }
 
         AstNode *member_node = AcuAstBuilder_GetNode(ws->builder, member_idx);
         if (unlikely(member_node->type != AST_IDENTIFIER)) {
             AcuWorkspace_PushError(ws, member_idx, ACU_ERR_ANALYZER_EXPECTED_IDENTIFIER_AFTER_DOT,
                                    (AcuError){0});
-            return TYPE_PRIMITIVE_UNIT;
+            V_At(&ws->node_types, member_idx) = ACU_NULL_IDX;
+            V_At(&ws->node_types, expr_idx) = ACU_NULL_IDX;
+            return ACU_NULL_IDX;
         }
 
         StringId member_name = member_node->as.identifier.name;
         ScopeId target_scope = AcuModuleManager_GetModuleScope(ws->modules, target_mod_id);
+        if (unlikely(target_scope == ACU_NULL_IDX)) {
+            V_At(&ws->node_types, member_idx) = ACU_NULL_IDX;
+            V_At(&ws->node_types, expr_idx) = ACU_NULL_IDX;
+            return ACU_NULL_IDX;
+        }
 
         SymbolId member_sym_id = AcuSymbolTable_LookupExact(ws->symbols, target_scope, member_name);
-        AcuSymbol *member_sym =
-            (member_sym_id != ACU_NULL_IDX) ? AcuSymbolTable_Get(ws->symbols, member_sym_id) : NULL;
-
         V_At(&ws->node_analysis, member_idx).reference.resolved_sym = member_sym_id;
         V_At(&ws->node_analysis, expr_idx).reference.resolved_sym = member_sym_id;
 
-        if (!member_sym) {
+        if (unlikely(member_sym_id == ACU_NULL_IDX)) {
             AcuWorkspace_PushError(ws, member_idx, ACU_ERR_ANALYZER_MODULE_MEMBER_NOT_FOUND,
                                    (AcuError){0});
-            return TYPE_PRIMITIVE_UNIT;
+            V_At(&ws->node_types, member_idx) = ACU_NULL_IDX;
+            V_At(&ws->node_types, expr_idx) = ACU_NULL_IDX;
+            return ACU_NULL_IDX;
         }
 
-        if ((member_sym->flags & ACU_SYMBOL_FLAG_EXPORTED) == 0) {
+        AcuSymbol *member_sym = AcuSymbolTable_Get(ws->symbols, member_sym_id);
+
+        if (unlikely((member_sym->flags & ACU_SYMBOL_FLAG_EXPORTED) == 0)) {
             AcuWorkspace_PushError(ws, member_idx, ACU_ERR_ANALYZER_PRIVATE_MEMBER_ACCESS,
                                    (AcuError){0});
         }
 
+        TypeId res_type = ACU_NULL_IDX;
         if (member_sym->kind == ACU_SYMBOL_GLOBAL_VAR) {
-            return AcuWorkspace_EnsureGlobalVarChecked(ws, member_sym_id);
+            res_type = AcuWorkspace_EnsureGlobalVarChecked(ws, member_sym_id);
+        } else {
+            res_type = member_sym->type;
         }
 
-        return member_sym->type;
+        V_At(&ws->node_types, member_idx) = res_type;
+        V_At(&ws->node_types, expr_idx) = res_type;
+        return res_type;
     }
 
     AcuWorkspace_PushError(ws, obj_idx, ACU_ERR_ANALYZER_TYPE_DOES_NOT_SUPPORT_MEMBER_ACCESS,
                            (AcuError){0});
-    return TYPE_PRIMITIVE_UNIT;
+    V_At(&ws->node_types, expr_idx) = ACU_NULL_IDX;
+    return ACU_NULL_IDX;
 }
 
 static TypeId AcuWorkspace_CheckBreak(AcuWorkspace *ws, ScopeId scope, AstNode *expr,
                                       AstNodeIdx expr_idx) {
     AcuLoopContext *current_loop = AcuWorkspace_GetCurrentLoop(ws);
+    AstNodeIdx break_expr = expr->as.break_stmt.expr;
+
     if (unlikely(!current_loop)) {
         AcuWorkspace_PushError(ws, expr_idx, ACU_ERR_ANALYZER_BREAK_OUTSIDE_LOOP, (AcuError){0});
+        if (break_expr != ACU_NULL_IDX) {
+            AcuWorkspace_CheckExpr(ws, scope, break_expr, ACU_NULL_IDX, false);
+        }
         return TYPE_PRIMITIVE_NEVER;
     }
 
     current_loop->has_break = true;
 
-    AstNodeIdx break_expr = expr->as.break_stmt.expr;
     TypeId break_val_type = TYPE_PRIMITIVE_UNIT;
-
     if (break_expr != ACU_NULL_IDX) {
-        break_val_type = AcuWorkspace_CheckExpr(ws, scope, break_expr, current_loop->expected_type);
+        break_val_type =
+            AcuWorkspace_CheckExpr(ws, scope, break_expr, current_loop->expected_type, true);
     }
 
     if (current_loop->kind == AST_WHILE) {
-        if (unlikely(break_val_type != TYPE_PRIMITIVE_UNIT &&
-                     break_val_type != TYPE_PRIMITIVE_NEVER)) {
-            AcuWorkspace_PushError(ws, expr_idx, ACU_ERR_ANALYZER_BREAK_WITH_VALUE_IN_WHILE,
+        if (unlikely(break_expr != ACU_NULL_IDX && break_val_type != ACU_NULL_IDX)) {
+            AcuWorkspace_PushError(ws, break_expr, ACU_ERR_ANALYZER_BREAK_WITH_VALUE_IN_WHILE,
                                    (AcuError){0});
         }
-    } else if (current_loop->kind == AST_LOOP) {
-        if (current_loop->expected_type == ACU_NULL_IDX) {
-            current_loop->expected_type = break_val_type;
-        } else {
-            if (unlikely(break_val_type != current_loop->expected_type &&
-                         break_val_type != TYPE_PRIMITIVE_NEVER)) {
-                AcuError err = {.as.type_mismatch = {.expected = current_loop->expected_type,
-                                                     .actual = break_val_type}};
-                AcuWorkspace_PushError(ws, expr_idx, ACU_ERR_ANALYZER_BREAK_TYPE_MISMATCH, err);
+        return TYPE_PRIMITIVE_NEVER;
+    }
+
+    if (current_loop->kind == AST_LOOP) {
+        if (break_val_type != TYPE_PRIMITIVE_NEVER && break_val_type != ACU_NULL_IDX) {
+            if (current_loop->expected_type == ACU_NULL_IDX ||
+                current_loop->expected_type == TYPE_PRIMITIVE_NEVER) {
+                current_loop->expected_type = break_val_type;
+            } else {
+                if (AcuWorkspace_CanCoerce(break_val_type, current_loop->expected_type)) {
+                } else if (AcuWorkspace_CanCoerce(current_loop->expected_type, break_val_type)) {
+                    current_loop->expected_type = break_val_type;
+                } else {
+                    AcuError err = {.as.type_mismatch = {.expected = current_loop->expected_type,
+                                                         .actual = break_val_type}};
+                    AstNodeIdx target_node = (break_expr != ACU_NULL_IDX) ? break_expr : expr_idx;
+                    AcuWorkspace_PushError(ws, target_node, ACU_ERR_ANALYZER_BREAK_TYPE_MISMATCH,
+                                           err);
+                }
             }
         }
     }
@@ -781,20 +967,22 @@ static TypeId AcuWorkspace_CheckContinue(AcuWorkspace *ws, AstNodeIdx expr_idx) 
 
 static TypeId AcuWorkspace_CheckReturn(AcuWorkspace *ws, ScopeId scope, AstNode *expr,
                                        AstNodeIdx expr_idx) {
+    AstNodeIdx ret_expr = expr->as.ret_stmt.expr;
+
     if (unlikely(ws->expected_return_type == ACU_NULL_IDX)) {
         AcuWorkspace_PushError(ws, expr_idx, ACU_ERR_ANALYZER_RETURN_OUTSIDE_FUNCTION,
                                (AcuError){0});
-        if (expr->as.ret_stmt.expr != ACU_NULL_IDX) {
-            AcuWorkspace_CheckExpr(ws, scope, expr->as.ret_stmt.expr, ACU_NULL_IDX);
+        if (ret_expr != ACU_NULL_IDX) {
+            AcuWorkspace_CheckExpr(ws, scope, ret_expr, ACU_NULL_IDX, false);
         }
         return TYPE_PRIMITIVE_NEVER;
     }
 
     TypeId expected = ws->expected_return_type;
 
-    if (expr->as.ret_stmt.expr != ACU_NULL_IDX) {
-        AcuWorkspace_CheckExpr(ws, scope, expr->as.ret_stmt.expr, expected);
-    } else if (expected != TYPE_PRIMITIVE_UNIT) {
+    if (ret_expr != ACU_NULL_IDX) {
+        AcuWorkspace_CheckExpr(ws, scope, ret_expr, expected, false);
+    } else if (unlikely(expected != TYPE_PRIMITIVE_UNIT)) {
         AcuError err = {.as.type_mismatch = {.expected = expected, .actual = TYPE_PRIMITIVE_UNIT}};
         AcuWorkspace_PushError(ws, expr_idx, ACU_ERR_ANALYZER_RETURN_MISSING_VALUE, err);
     }
@@ -807,30 +995,37 @@ static TypeId AcuWorkspace_CheckTypeCast(AcuWorkspace *ws, ScopeId scope, AstNod
     TypeAstNodeIdx type_hint = expr->as.type_cast.target_type;
     TypeId target_type = AcuWorkspace_ResolveAstType(ws, scope, type_hint);
 
+    AstNodeIdx inner_expr_idx = expr->as.type_cast.expr;
+
+    TypeId actual_type = AcuWorkspace_CheckExpr(ws, scope, inner_expr_idx, target_type, true);
+
     if (unlikely(target_type == ACU_NULL_IDX)) {
-        return TYPE_PRIMITIVE_UNIT;
+        return ACU_NULL_IDX;
     }
 
-    AstNodeIdx inner_expr_idx = expr->as.type_cast.expr;
-    TypeId actual_type = AcuWorkspace_CheckExpr(ws, scope, inner_expr_idx, target_type);
-
-    if (unlikely(actual_type == TYPE_PRIMITIVE_NEVER)) {
+    if (actual_type == TYPE_PRIMITIVE_NEVER) {
         return TYPE_PRIMITIVE_NEVER;
     }
 
-    bool is_valid_cast = actual_type == target_type;
+    if (unlikely(actual_type == ACU_NULL_IDX)) {
+        return target_type;
+    }
 
-    if (unlikely(actual_type == TYPE_PRIMITIVE_I1 || target_type == TYPE_PRIMITIVE_I1)) {
+    bool is_valid_cast = false;
+
+    if (actual_type == target_type) {
+        is_valid_cast = true;
+    } else if (actual_type == TYPE_PRIMITIVE_I1) {
+        is_valid_cast = TypePrimitiveKind_IsInteger(target_type);
+    } else if (target_type == TYPE_PRIMITIVE_I1) {
         is_valid_cast = false;
     } else {
-        bool actual_is_int = TypePrimitiveKind_IsInteger(actual_type);
-        bool target_is_int = TypePrimitiveKind_IsInteger(target_type);
+        bool actual_is_num =
+            TypePrimitiveKind_IsInteger(actual_type) || TypePrimitiveKind_IsFloat(actual_type);
+        bool target_is_num =
+            TypePrimitiveKind_IsInteger(target_type) || TypePrimitiveKind_IsFloat(target_type);
 
-        bool actual_is_float = TypePrimitiveKind_IsFloat(actual_type);
-        bool target_is_float = TypePrimitiveKind_IsFloat(target_type);
-
-        is_valid_cast =
-            (bool)((actual_is_int || actual_is_float) && (target_is_int || target_is_float));
+        is_valid_cast = actual_is_num && target_is_num;
     }
 
     if (unlikely(!is_valid_cast)) {
@@ -842,55 +1037,203 @@ static TypeId AcuWorkspace_CheckTypeCast(AcuWorkspace *ws, ScopeId scope, AstNod
     return target_type;
 }
 
+typedef struct {
+    TypeId type;
+    SymbolId root_sym;
+    bool is_lvalue;
+    bool is_mutable;
+} AcuLValueInfo;
+
+static AcuLValueInfo AcuWorkspace_CheckLValue(AcuWorkspace *ws, ScopeId scope,
+                                              AstNodeIdx expr_idx) {
+    AcuLValueInfo info = {
+        .type = ACU_NULL_IDX,
+        .root_sym = ACU_NULL_IDX,
+        .is_lvalue = false,
+        .is_mutable = false,
+    };
+
+    if (unlikely(expr_idx == ACU_NULL_IDX)) {
+        return info;
+    }
+
+    AstNode *node = AcuAstBuilder_GetNode(ws->builder, expr_idx);
+
+    if (node->type == AST_IDENTIFIER) {
+        StringId name = node->as.identifier.name;
+        SymbolId sym_id = AcuSymbolTable_Lookup(ws->symbols, scope, name);
+
+        V_At(&ws->node_analysis, expr_idx).reference.resolved_sym = sym_id;
+
+        if (unlikely(sym_id == ACU_NULL_IDX)) {
+            AcuWorkspace_PushError(ws, expr_idx, ACU_ERR_ANALYZER_UNDECLARED_IDENTIFIER,
+                                   (AcuError){0});
+            return info;
+        }
+
+        AcuSymbol *sym = AcuSymbolTable_Get(ws->symbols, sym_id);
+
+        if (sym->kind == ACU_SYMBOL_GLOBAL_VAR) {
+            AcuWorkspace_EnsureGlobalVarChecked(ws, sym_id);
+            sym = AcuSymbolTable_Get(ws->symbols, sym_id);
+        }
+
+        bool is_var = (sym->kind == ACU_SYMBOL_LOCAL_VAR || sym->kind == ACU_SYMBOL_GLOBAL_VAR);
+        if (unlikely(!is_var)) {
+            AcuWorkspace_PushError(ws, expr_idx, ACU_ERR_ANALYZER_INVALID_LVALUE, (AcuError){0});
+            return info;
+        }
+
+        info.is_lvalue = true;
+        info.is_mutable = (sym->flags & ACU_SYMBOL_FLAG_MUTABLE) != 0;
+        info.root_sym = sym_id;
+        info.type = sym->type;
+
+        V_At(&ws->node_types, expr_idx) = info.type;
+        return info;
+    }
+
+    if (node->type == AST_DOT) {
+        AstNodeIdx obj_idx = node->as.dot.object;
+        AstNodeIdx member_idx = node->as.dot.member;
+
+        TypeId obj_type = AcuWorkspace_CheckExpr(ws, scope, obj_idx, ACU_NULL_IDX, false);
+
+        if (obj_type == TYPE_PRIMITIVE_NEVER) {
+            info.type = TYPE_PRIMITIVE_NEVER;
+            return info;
+        }
+
+        if (unlikely(obj_type == ACU_NULL_IDX)) {
+            return info;
+        }
+
+        if (obj_type == TYPE_PRIMITIVE_MODULE) {
+            ModuleId mod_id = AcuWorkspace_GetModuleFromExpr(ws, scope, obj_idx);
+            if (unlikely(mod_id == ACU_NULL_IDX)) {
+                AcuWorkspace_PushError(ws, obj_idx, ACU_ERR_ANALYZER_EXPECTED_MODULE_BEFORE_DOT,
+                                       (AcuError){0});
+                return info;
+            }
+
+            AstNode *member_node = AcuAstBuilder_GetNode(ws->builder, member_idx);
+            if (unlikely(member_node->type != AST_IDENTIFIER)) {
+                AcuWorkspace_PushError(
+                    ws, member_idx, ACU_ERR_ANALYZER_EXPECTED_IDENTIFIER_AFTER_DOT, (AcuError){0});
+                return info;
+            }
+
+            StringId member_name = member_node->as.identifier.name;
+            ScopeId target_scope = AcuModuleManager_GetModuleScope(ws->modules, mod_id);
+
+            SymbolId member_sym_id =
+                AcuSymbolTable_LookupExact(ws->symbols, target_scope, member_name);
+            AcuSymbol *member_sym = (member_sym_id != ACU_NULL_IDX)
+                                        ? AcuSymbolTable_Get(ws->symbols, member_sym_id)
+                                        : NULL;
+
+            V_At(&ws->node_analysis, member_idx).reference.resolved_sym = member_sym_id;
+            V_At(&ws->node_analysis, expr_idx).reference.resolved_sym = member_sym_id;
+
+            if (unlikely(!member_sym)) {
+                AcuWorkspace_PushError(ws, member_idx, ACU_ERR_ANALYZER_MODULE_MEMBER_NOT_FOUND,
+                                       (AcuError){0});
+                return info;
+            }
+
+            if (unlikely((member_sym->flags & ACU_SYMBOL_FLAG_EXPORTED) == 0)) {
+                AcuWorkspace_PushError(ws, member_idx, ACU_ERR_ANALYZER_PRIVATE_MEMBER_ACCESS,
+                                       (AcuError){0});
+            }
+
+            if (unlikely(member_sym->kind != ACU_SYMBOL_GLOBAL_VAR)) {
+                AcuWorkspace_PushError(ws, member_idx, ACU_ERR_ANALYZER_INVALID_LVALUE,
+                                       (AcuError){0});
+                return info;
+            }
+
+            TypeId var_type = AcuWorkspace_EnsureGlobalVarChecked(ws, member_sym_id);
+            member_sym = AcuSymbolTable_Get(ws->symbols, member_sym_id);
+
+            info.is_lvalue = true;
+            info.is_mutable = (member_sym->flags & ACU_SYMBOL_FLAG_MUTABLE) != 0;
+            info.root_sym = member_sym_id;
+            info.type = var_type;
+
+            V_At(&ws->node_types, member_idx) = var_type;
+            V_At(&ws->node_types, expr_idx) = var_type;
+            return info;
+        }
+
+        AcuWorkspace_PushError(ws, obj_idx, ACU_ERR_ANALYZER_TYPE_DOES_NOT_SUPPORT_MEMBER_ACCESS,
+                               (AcuError){0});
+        return info;
+    }
+
+    AcuWorkspace_PushError(ws, expr_idx, ACU_ERR_ANALYZER_INVALID_LVALUE, (AcuError){0});
+    return info;
+}
+
 static TypeId AcuWorkspace_CheckAssign(AcuWorkspace *ws, ScopeId scope, AstNode *expr,
                                        AstNodeIdx expr_idx) {
     AstNodeIdx target_idx = expr->as.assign.target;
     AstNodeIdx value_idx = expr->as.assign.value;
+    AstAssignKind assign_kind = expr->as.assign.type;
 
-    AstNode *target_node = AcuAstBuilder_GetNode(ws->builder, target_idx);
+    TypeId target_type = AcuWorkspace_CheckExpr(ws, scope, target_idx, ACU_NULL_IDX, false);
 
-    if (target_node->type != AST_IDENTIFIER) {
-        AcuWorkspace_PushError(ws, target_idx, ACU_ERR_ANALYZER_INVALID_LVALUE, (AcuError){0});
-        return TYPE_PRIMITIVE_UNIT;
+    if (target_type != ACU_NULL_IDX) {
+        AcuLValueStatus status = AcuWorkspace_GetLValueStatus(ws, target_idx);
+
+        if (unlikely(!status.is_lvalue)) {
+            AcuWorkspace_PushError(ws, target_idx, ACU_ERR_ANALYZER_INVALID_LVALUE, (AcuError){0});
+        } else if (unlikely(!status.is_mutable)) {
+            AcuWorkspace_PushError(ws, expr_idx, ACU_ERR_ANALYZER_ASSIGN_TO_IMMUTABLE,
+                                   (AcuError){0});
+        }
     }
 
-    StringId name = target_node->as.identifier.name;
-    SymbolId sym_id = AcuSymbolTable_Lookup(ws->symbols, scope, name);
+    AstBinaryKind bin_op = (assign_kind != AST_ASSIGN_EQ) ? AstAssignKind_ToBinaryKind(assign_kind)
+                                                          : (AstBinaryKind)ACU_NULL_IDX;
 
-    V_At(&ws->node_analysis, target_idx).reference.resolved_sym = sym_id;
-    V_At(&ws->node_analysis, expr_idx).reference.resolved_sym = sym_id;
-
-    if (sym_id == ACU_NULL_IDX) {
-        AcuWorkspace_PushError(ws, target_idx, ACU_ERR_ANALYZER_UNDECLARED_IDENTIFIER,
-                               (AcuError){0});
-        return TYPE_PRIMITIVE_UNIT;
+    if (bin_op != (AstBinaryKind)ACU_NULL_IDX && target_type != ACU_NULL_IDX) {
+        if (unlikely(!AcuWorkspace_IsValidBinaryOperand(bin_op, target_type))) {
+            AcuWorkspace_PushError(ws, expr_idx, ACU_ERR_ANALYZER_UNSUPPORTED_OPERATION,
+                                   (AcuError){0});
+        }
     }
 
-    AcuSymbol *sym = AcuSymbolTable_Get(ws->symbols, sym_id);
+    TypeId val_type = AcuWorkspace_CheckExpr(ws, scope, value_idx, target_type, false);
 
-    if (sym->kind == ACU_SYMBOL_GLOBAL_VAR) {
-        AcuWorkspace_EnsureGlobalVarChecked(ws, sym_id);
-        sym = AcuSymbolTable_Get(ws->symbols, sym_id);
+    if (val_type == TYPE_PRIMITIVE_NEVER) {
+        V_At(&ws->node_types, expr_idx) = TYPE_PRIMITIVE_NEVER;
+        return TYPE_PRIMITIVE_NEVER;
     }
 
-    if ((sym->flags & ACU_SYMBOL_FLAG_MUTABLE) == 0) {
-        AcuWorkspace_PushError(ws, expr_idx, ACU_ERR_ANALYZER_ASSIGN_TO_IMMUTABLE, (AcuError){0});
+    if (bin_op != (AstBinaryKind)ACU_NULL_IDX && target_type != ACU_NULL_IDX &&
+        val_type != ACU_NULL_IDX) {
+        TypeId result_op_type = AcuWorkspace_GetBinaryResultType(bin_op, target_type, val_type);
+
+        if (unlikely(result_op_type == ACU_NULL_IDX ||
+                     !AcuWorkspace_CanCoerce(result_op_type, target_type))) {
+            AcuError err = {
+                .as.type_mismatch =
+                    {
+                        .expected = target_type,
+                        .actual = (result_op_type != ACU_NULL_IDX) ? result_op_type : val_type,
+                    },
+            };
+            AcuWorkspace_PushError(ws, expr_idx, ACU_ERR_ANALYZER_TYPE_MISMATCH, err);
+        }
     }
 
-    TypeId target_type = sym->type;
-    TypeId val_type = AcuWorkspace_CheckExpr(ws, scope, value_idx, target_type);
-
-    if (unlikely(!AcuWorkspace_CanCoerce(val_type, target_type))) {
-        AcuError err = {.as.type_mismatch = {.expected = target_type, .actual = val_type}};
-        AcuWorkspace_PushError(ws, value_idx, ACU_ERR_ANALYZER_TYPE_MISMATCH, err);
-    }
-
-    return val_type == TYPE_PRIMITIVE_NEVER ? TYPE_PRIMITIVE_NEVER : TYPE_PRIMITIVE_UNIT;
+    V_At(&ws->node_types, expr_idx) = TYPE_PRIMITIVE_UNIT;
+    return TYPE_PRIMITIVE_UNIT;
 }
 
 static TypeId AcuWorkspace_CheckExpr(AcuWorkspace *ws, ScopeId scope, AstNodeIdx expr_idx,
-                                     TypeId expected_type) {
-    if (expr_idx == ACU_NULL_IDX) {
+                                     TypeId expected_type, bool is_hint) {
+    if (unlikely(expr_idx == ACU_NULL_IDX)) {
         return TYPE_PRIMITIVE_UNIT;
     }
 
@@ -935,7 +1278,7 @@ static TypeId AcuWorkspace_CheckExpr(AcuWorkspace *ws, ScopeId scope, AstNodeIdx
             break;
 
         case AST_UNIT:
-            result_type = AcuWorkspace_CheckUnit(ws, expected_type, expr_idx);
+            result_type = AcuWorkspace_CheckUnit();
             break;
 
         case AST_UNARY:
@@ -947,11 +1290,11 @@ static TypeId AcuWorkspace_CheckExpr(AcuWorkspace *ws, ScopeId scope, AstNodeIdx
             break;
 
         case AST_LOOP:
-            result_type = AcuWorkspace_CheckLoop(ws, scope, expr, expr_idx, expected_type);
+            result_type = AcuWorkspace_CheckLoop(ws, scope, expr, expected_type);
             break;
 
         case AST_WHILE:
-            result_type = AcuWorkspace_CheckWhile(ws, scope, expr, expr_idx);
+            result_type = AcuWorkspace_CheckWhile(ws, scope, expr);
             break;
 
         case AST_BREAK:
@@ -976,12 +1319,17 @@ static TypeId AcuWorkspace_CheckExpr(AcuWorkspace *ws, ScopeId scope, AstNodeIdx
 
     TypeId final_type;
     if (expected_type != ACU_NULL_IDX) {
-        if (unlikely(!AcuWorkspace_CanCoerce(result_type, expected_type))) {
-            AcuError err = {.as.type_mismatch = {.expected = expected_type, .actual = result_type}};
-            AcuWorkspace_PushError(ws, expr_idx, ACU_ERR_ANALYZER_TYPE_MISMATCH, err);
-            final_type = expected_type;
+        if (!AcuWorkspace_CanCoerce(result_type, expected_type)) {
+            if (unlikely(!is_hint)) {
+                AcuError err = {
+                    .as.type_mismatch = {.expected = expected_type, .actual = result_type}};
+                AcuWorkspace_PushError(ws, expr_idx, ACU_ERR_ANALYZER_TYPE_MISMATCH, err);
+                final_type = expected_type;
+            } else {
+                final_type = result_type;
+            }
         } else {
-            if (unlikely(result_type == TYPE_PRIMITIVE_NEVER)) {
+            if (result_type == TYPE_PRIMITIVE_NEVER) {
                 final_type = TYPE_PRIMITIVE_NEVER;
             } else {
                 final_type = expected_type;
@@ -1043,7 +1391,7 @@ bool AcuWorkspace_Pass3_TypeCheck(AcuWorkspace *ws) {
                     break;
 
                 default: {
-                    AcuWorkspace_CheckExpr(ws, mod_scope, stmt_idx, ACU_NULL_IDX);
+                    AcuWorkspace_CheckExpr(ws, mod_scope, stmt_idx, ACU_NULL_IDX, false);
                     break;
                 }
             }
@@ -1121,7 +1469,7 @@ bool AcuWorkspace_Pass3_TypeCheck(AcuWorkspace *ws) {
                     TypeId prev_expected = ws->expected_return_type;
                     ws->expected_return_type = ret_type;
 
-                    AcuWorkspace_CheckExpr(ws, body_scope, stmt->as.fn_decl.body, ret_type);
+                    AcuWorkspace_CheckExpr(ws, body_scope, stmt->as.fn_decl.body, ret_type, true);
 
                     ws->expected_return_type = prev_expected;
                 }

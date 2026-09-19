@@ -55,19 +55,24 @@
     X(AST_UNARY_PLUS, "+", AST_OPERATOR_CATEGORY_ARITHMETIC)                                       \
     X(AST_UNARY_MINUS, "-", AST_OPERATOR_CATEGORY_ARITHMETIC)
 
+#define X_AST_COMPOUND_ASSIGN_NODE_KIND(X)                                                         \
+    X(AST_ASSIGN_ADD_EQ, "+=", AST_BINARY_ADD)                                                     \
+    X(AST_ASSIGN_SUB_EQ, "-=", AST_BINARY_SUB)                                                     \
+    X(AST_ASSIGN_MUL_EQ, "*=", AST_BINARY_MUL)                                                     \
+    X(AST_ASSIGN_POW_EQ, "**=", AST_BINARY_POW)                                                    \
+    X(AST_ASSIGN_DIV_EQ, "/=", AST_BINARY_DIV)                                                     \
+    X(AST_ASSIGN_REM_EQ, "%=", AST_BINARY_REM)                                                     \
+    X(AST_ASSIGN_BITWISE_AND_EQ, "&=", AST_BINARY_BITWISE_AND)                                     \
+    X(AST_ASSIGN_BITWISE_OR_EQ, "|=", AST_BINARY_BITWISE_OR)                                       \
+    X(AST_ASSIGN_BITWISE_XOR_EQ, "^=", AST_BINARY_BITWISE_XOR)                                     \
+    X(AST_ASSIGN_SHL_EQ, "<<=", AST_BINARY_SHL)                                                    \
+    X(AST_ASSIGN_SHR_EQ, ">>=", AST_BINARY_SHR)                                                    \
+    X(AST_ASSIGN_LOGICAL_AND_EQ, "&&=", AST_BINARY_LOGICAL_AND)                                    \
+    X(AST_ASSIGN_LOGICAL_OR_EQ, "||=", AST_BINARY_LOGICAL_OR)
+
 #define X_AST_ASSIGN_NODE_KIND(X)                                                                  \
-    X(AST_ASSIGN_EQ, "=")                                                                          \
-    X(AST_ASSIGN_ADD_EQ, "+=")                                                                     \
-    X(AST_ASSIGN_SUB_EQ, "-=")                                                                     \
-    X(AST_ASSIGN_MUL_EQ, "*=")                                                                     \
-    X(AST_ASSIGN_POW_EQ, "**=")                                                                    \
-    X(AST_ASSIGN_DIV_EQ, "/=")                                                                     \
-    X(AST_ASSIGN_REM_EQ, "%=")                                                                     \
-    X(AST_ASSIGN_BITWISE_AND_EQ, "&=")                                                             \
-    X(AST_ASSIGN_BITWISE_OR_EQ, "|=")                                                              \
-    X(AST_ASSIGN_BITWISE_XOR_EQ, "^=")                                                             \
-    X(AST_ASSIGN_SHL_EQ, "<<=")                                                                    \
-    X(AST_ASSIGN_SHR_EQ, ">>=")
+    X(AST_ASSIGN_EQ, "=", (AstBinaryKind)ACU_NULL_IDX)                                             \
+    X_AST_COMPOUND_ASSIGN_NODE_KIND(X)
 
 #define X_ACU_PRECEDENCE(X)                                                                        \
     X(ACU_PRECEDENCE_NONE, "None")                                                                 \
@@ -122,7 +127,7 @@ typedef enum {
 } AstOperatorCategory;
 
 typedef enum {
-#define X(name, text, category) name,
+#define X(name, ...) name,
     X_AST_UNARY_NODE_KIND(X)
 #undef X
 } AstUnaryKind;
@@ -133,12 +138,14 @@ attribute_const AstOperatorCategory AstBinaryKind_GetCategory(AstBinaryKind op);
 attribute_const AstOperatorCategory AstUnaryKind_GetCategory(AstUnaryKind op);
 
 typedef enum {
-#define X(name, text) name,
+#define X(name, ...) name,
     X_AST_ASSIGN_NODE_KIND(X)
 #undef X
 } AstAssignKind;
 
 const u8 *AstAssignKind_String(AstAssignKind);
+
+attribute_const AstBinaryKind AstAssignKind_ToBinaryKind(AstAssignKind);
 
 enum {
     AST_FLAG_EXPORTED = 1 << 0,

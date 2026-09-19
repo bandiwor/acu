@@ -2056,7 +2056,8 @@ AcuTarget AcuCodeGen_EmitExpr(AcuCodeGen *cg, AstNodeIdx expr_idx, AcuTarget tar
     AstNode *node = AcuAstBuilder_GetNode(cg->ws->builder, expr_idx);
     TypeId node_type = V_At(&cg->ws->node_types, expr_idx);
 
-    if (node->type == AST_BINARY || node->type == AST_UNARY) {
+    if (node->type == AST_BINARY || node->type == AST_UNARY || node->type == AST_TYPE_CAST ||
+        node->type == AST_CALL) {
         AcuConstVal folded = AcuCodeGen_EvalConst(cg->ws, expr_idx);
         if (folded.kind != CONST_NONE) {
             return AcuCodeGen_EmitFoldedConstant(cg, folded, node_type, target);

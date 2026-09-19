@@ -44,29 +44,27 @@ const u8 *AstUnaryKind_String(AstUnaryKind kind) {
 }
 
 const u8 *AstAssignKind_String(AstAssignKind kind) {
-#define X(name, msg)                                                                               \
-    case name:                                                                                     \
-        return (const u8 *)(msg);
-
     switch (kind) {
+#define X(name, text, binary_kind)                                                                 \
+    case name:                                                                                     \
+        return (const u8 *)(text);
         X_AST_ASSIGN_NODE_KIND(X)
-        default:
-            acu_unreachable_debug("Unknown kind: %d\n", kind);
-    }
 #undef X
+        default:
+            acu_unreachable_debug("Unknown assign kind (%d)", kind);
+    }
 }
 
 attribute_const const u8 *AcuPrecedence_String(AcuPrecedence prec) {
-#define X(name, msg)                                                                               \
-    case name:                                                                                     \
-        return (const u8 *)(msg);
-
     switch (prec) {
-        X_AST_ASSIGN_NODE_KIND(X)
+#define X(name, text)                                                                              \
+    case name:                                                                                     \
+        return (const u8 *)(text);
+        X_ACU_PRECEDENCE(X)
+#undef X
         default:
             acu_unreachable_debug("Unknown prec: %d\n", prec);
     }
-#undef X
 }
 
 attribute_const AcuPrecedence AcuPrecedence_FromTokenType(AcuTokenType type) {
@@ -109,4 +107,16 @@ attribute_const AstOperatorCategory AstUnaryKind_GetCategory(AstUnaryKind op) {
     }
 
     return (AstOperatorCategory)category_table[op];
+}
+
+attribute_const AstBinaryKind AstAssignKind_ToBinaryKind(AstAssignKind op) {
+    switch (op) {
+#define X(name, text, binary_kind)                                                                 \
+    case name:                                                                                     \
+        return binary_kind;
+        X_AST_COMPOUND_ASSIGN_NODE_KIND(X)
+#undef X
+        default:
+            acu_unreachable_debug("Unexpected or non-compound assign operator kind (%d)", op);
+    }
 }
